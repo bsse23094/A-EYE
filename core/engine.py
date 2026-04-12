@@ -368,14 +368,56 @@ class JarvisEngine:
 
     def _on_vision_identify(self, result: str) -> None:
         """Fired by VisionEngine when the pointing gesture triggers identification."""
-        self.on_assistant_token(f"\n\n[Identify] {result}")
-        self.on_assistant_done(result)
-        if self.tts and not self._processing:
-            threading.Thread(
-                target=self.tts.speak,
-                args=(f"Object identified: {result}",),
-                daemon=True,
-            ).start()
+        import re as _re
+
+        # ── Clean for display ─────────────────────────────────────
+        display_result = result.strip()
+        self.on_assistant_token(f"\n\n[Vision scan] {display_result}")
+        self.on_assistant_done(display_result)
+
+        if not (self.tts and not self._processing):
+            return
+
+        # ── Strip markdown / brackets for TTS ────────────────────
+        clean = _re.sub(r"[\[\]#*_`>]", "", display_result).strip()
+        # Collapse multiple spaces/newlines
+        clean = _re.sub(r"\s{2,}", " ", clean)
+
+        # ── Wrap in a JARVIS-style spoken line ────────────────────
+        # If it's an error / warning message, speak it plain
+        error_keywords = ("cannot", "failed", "unavailable", "not installed",
+                          "not running", "make sure", "run:", "ollama")
+        is_error = any(k in clean.lower() for k in error_keywords)
+
+        if is_error:
+            spoken = clean
+        elif not clean or len(clean) < 4:
+            spoken = "Scan complete, sir. Nothing conclusive to report."
+        else:
+            # Route through LLM for a one-sentence JARVIS-style response
+            # (non-blocking; runs in the already-background thread)
+            try:
+                if self.llm:
+                    prompt = (
+                        f"The vision scan just identified this object: \"{clean}\". "
+                        "Deliver the identification result to the user in one short, "
+                        "characterful JARVIS sentence. Be dry, witty if it's mundane, "
+                        "or precise if it's technical hardware. No bullet points."
+                    )
+                    spoken_parts = []
+                    for tok in self.llm.stream_chat(prompt, vision_context=None, preference_context=None):
+                        spoken_parts.append(tok)
+                        self.on_assistant_token(tok)
+                    spoken = "".join(spoken_parts).strip()
+                    self.on_assistant_done(spoken)
+                    # Remove any accidental tool call markers
+                    spoken = _re.sub(r"\[TOOL[^\]]*\]", "", spoken).strip()
+                else:
+                    spoken = f"Object scanned, sir. {clean}"
+            except Exception:
+                spoken = f"Scan complete. {clean}"
+
+        threading.Thread(target=self.tts.speak, args=(spoken,), daemon=True).start()
 
     def get_camera_frame(self):
         if self.vision:
