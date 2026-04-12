@@ -1,0 +1,18 @@
+# A-EYE Jarvis — Python Dependencies
+faster-whisper
+edge-tts
+pyttsx3
+ultralytics
+opencv-python
+sounddevice
+numpy
+httpx
+PyQt6
+pygame
+beautifulsoup4
+requests
+Pillow
+ddgs
+pyautogui
+psutil
+mediapipe>=0.10.14; python_version < "3.13"
