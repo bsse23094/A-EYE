@@ -325,14 +325,8 @@ He calls you **sir**. He understands Urdu. He responds in British English. He is
 
 ## 👨‍💻 Author
 
-Built by **BK** — embedded electronics enthusiast, Laravel developer, and aspiring Tony Stark.  
+Built by **Ahmed Ayyan** — embedded electronics, AI/ML enthusiast, Laravel developer, and aspiring Tony Stark.  
 Location: Lahore, Pakistan 🇵🇰  
-
----
-
-## 📜 License
-
-MIT — do whatever you want. Just don't use it for evil. JARVIS would disapprove.
 
 ---
 
