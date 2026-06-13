@@ -44,6 +44,7 @@ _DEFAULTS: dict[str, Any] = {
 
     # ── Agent ────────────────────────────────────────────────────
     "show_thinking": True,         # stream thinking-model reasoning to the UI
+    "auto_memory": True,           # background pass learns user facts each turn
     "max_tool_iterations": 8,      # tool-call rounds per user turn
     "max_tool_result_chars": 8000, # truncate tool output fed to the model
     "max_history_messages": 30,    # messages of history sent per request
@@ -76,10 +77,19 @@ _DEFAULTS: dict[str, Any] = {
     # ── Misc tools ───────────────────────────────────────────────
     "news_region": "PK",
     "news_lang": "en",
-    # Email: fill in to enable email tools. Use an app password.
+    # Email: fill in to enable Gmail automation. Use a Google app password
+    # (myaccount.google.com -> Security -> App passwords), not your login.
     # {"imap_host": "imap.gmail.com", "smtp_host": "smtp.gmail.com",
     #  "user": "you@gmail.com", "password": "app-password"}
     "email": {},
+    # >0 = poll the inbox every N minutes and notify on new mail.
+    "email_check_minutes": 0,
+    # When watching, generate a one-line AI summary for each new arrival.
+    "email_smart_notify": False,
+    # Inbox rules applied to incoming mail by the watcher. Each rule:
+    # {"name": "Boss", "from": "boss@", "subject": "", "priority": true}
+    # First case-insensitive substring match wins; empty field = any.
+    "email_rules": [],
 }
 
 

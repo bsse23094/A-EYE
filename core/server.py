@@ -11,8 +11,17 @@ Endpoints:
     POST /api/chat          {"text": ...} -> {"turn_id": ...}
     POST /api/stop          cancel the in-flight turn
     GET  /api/history       current session transcript (for page reloads)
+    GET  /api/changes       recent agent file edits (diffs) for the IDE view
+    GET  /api/export        download the session transcript as markdown
+    GET  /api/memory        profile + facts JARVIS has learned
+    POST /api/memory/profile  {"key", "value"}  (empty value deletes)
+    POST /api/memory/fact     {"content", "topic"?}
+    POST /api/memory/forget   {"id"}
     GET  /api/status        models/routes/voice/session snapshot
     POST /api/voice         {"on": true|false}
+    POST /api/upload        {"name", "data_b64"} -> saved path (pdf/image/...)
+    GET  /api/sessions      past conversations (id, title, date, count)
+    POST /api/session/load  {"id"} -> continue an earlier conversation
     POST /api/session/new   fresh conversation
     GET  /api/models        discovery summary (?refresh=1 to re-scan)
     POST /api/model         {"role": "chat", "name": "qwen3:8b"|"auto"}
@@ -25,24 +34,24 @@ Endpoints:
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import queue
-import re
 import socket
 import threading
+import time
 import webbrowser
 
 from .assistant import Assistant
-from .config import config
+from .config import DATA_DIR, config
 
-_TOOL_LOG_RX = re.compile(r"\n\[tools used: .*\]$", re.DOTALL)
 _MAX_EDIT_BYTES = 2_000_000
 
 
 def create_app(assistant: Assistant):
     from fastapi import FastAPI
-    from fastapi.responses import HTMLResponse, StreamingResponse
+    from fastapi.responses import HTMLResponse, Response, StreamingResponse
 
     app = FastAPI(title="JARVIS", docs_url=None, redoc_url=None)
 
@@ -82,12 +91,53 @@ def create_app(assistant: Assistant):
 
     @app.get("/api/history")
     def history(limit: int = 60):
-        msgs = []
-        for m in assistant.memory.recent_messages(max(1, min(200, limit))):
-            content = _TOOL_LOG_RX.sub("", m["content"])
-            if content.strip():
-                msgs.append({"role": m["role"], "content": content})
+        msgs = [{"role": m["role"], "content": m["content"]}
+                for m in assistant.memory.recent_messages(max(1, min(200, limit)))
+                if m["content"].strip()]
         return {"messages": msgs, "session": assistant.memory.session_id}
+
+    @app.get("/api/changes")
+    def changes():
+        return {"changes": assistant.file_changes}
+
+    @app.get("/api/export")
+    def export():
+        name, text = assistant.memory.export_markdown()
+        return Response(content=text, media_type="text/markdown; charset=utf-8",
+                        headers={"Content-Disposition":
+                                 f'attachment; filename="{name}"'})
+
+    # ── Memory: what JARVIS knows about the user ─────────────────
+
+    @app.get("/api/memory")
+    def memory():
+        return {"profile": assistant.memory.profile_all(),
+                "facts": [{"id": fid, "content": content, "topic": topic}
+                          for fid, content, topic in assistant.memory.all_facts()]}
+
+    @app.post("/api/memory/profile")
+    def memory_profile(body: dict):
+        key = (body.get("key") or "").strip()
+        value = (body.get("value") or "").strip()
+        if not key:
+            return {"error": "No key."}
+        if value:
+            assistant.memory.profile_set(key, value)
+        else:
+            assistant.memory.profile_delete(key)
+        return {"ok": True}
+
+    @app.post("/api/memory/fact")
+    def memory_fact(body: dict):
+        content = (body.get("content") or "").strip()
+        if not content:
+            return {"error": "Nothing to remember."}
+        fid = assistant.memory.remember(content, body.get("topic") or "")
+        return {"ok": True, "id": fid}
+
+    @app.post("/api/memory/forget")
+    def memory_forget(body: dict):
+        return {"ok": assistant.memory.forget(int(body.get("id") or 0))}
 
     @app.get("/api/status")
     def status():
@@ -101,6 +151,39 @@ def create_app(assistant: Assistant):
     @app.post("/api/session/new")
     def new_session():
         return {"session": assistant.new_session()}
+
+    @app.get("/api/sessions")
+    def sessions():
+        return {"sessions": assistant.memory.sessions(),
+                "current": assistant.memory.session_id}
+
+    @app.post("/api/session/load")
+    def session_load(body: dict):
+        ok = assistant.memory.switch_session(int(body.get("id") or 0))
+        return {"ok": ok, "session": assistant.memory.session_id}
+
+    @app.post("/api/upload")
+    def upload(body: dict):
+        data = body.get("data_b64") or ""
+        if len(data) > 34_000_000:                 # ~25 MB decoded
+            return {"error": "File too large (25 MB max)."}
+        try:
+            raw = base64.b64decode(data)
+        except Exception:
+            return {"error": "Bad upload data."}
+        if not raw:
+            return {"error": "Empty file."}
+        name = os.path.basename((body.get("name") or "").strip()) \
+            or f"upload_{int(time.time())}"
+        updir = os.path.join(DATA_DIR, "uploads")
+        os.makedirs(updir, exist_ok=True)
+        path = os.path.join(updir, name)
+        if os.path.exists(path):
+            stem, ext = os.path.splitext(name)
+            path = os.path.join(updir, f"{stem}_{int(time.time())}{ext}")
+        with open(path, "wb") as f:
+            f.write(raw)
+        return {"ok": True, "path": path, "size": len(raw)}
 
     @app.get("/api/models")
     def models(refresh: int = 0):
@@ -171,6 +254,89 @@ def create_app(assistant: Assistant):
             return {"ok": True, "path": full}
         except OSError as e:
             return {"error": str(e)}
+
+    # ── Hardware inspection ──────────────────────────────────────
+
+    @app.get("/api/hardware")
+    def hardware():
+        from .tools import hardware as hw
+        try:
+            return hw.snapshot()
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"}
+
+    @app.post("/api/hardware/recommend")
+    def hardware_recommend(body: dict = None):
+        from .tools import hardware as hw
+        try:
+            snap = body.get("snapshot") if body and body.get("snapshot") else hw.snapshot()
+            report = hw.report_text(snap)
+        except Exception as e:
+            return {"error": f"could not read hardware: {e}"}
+        advice = assistant.quick_complete(hw.RECOMMEND_SYSTEM, report,
+                                          num_predict=350, temperature=0.3)
+        return {"advice": advice, "report": report}
+
+    @app.get("/api/roast")
+    def roast():
+        from .tools import hardware as hw
+        try:
+            report = hw.report_text()
+        except Exception as e:
+            return {"error": str(e)}
+        text = assistant.quick_complete(
+            "You are JARVIS in a playful mood. Roast the user's PC based on "
+            "this hardware snapshot — witty, dry, affectionate, 2-3 sentences. "
+            "Reference real numbers. Keep it light, never mean.",
+            report, num_predict=160, temperature=0.9)
+        return {"roast": text}
+
+    # ── Mail panel (only meaningful when email is configured) ────
+
+    @app.get("/api/mail")
+    def mail(limit: int = 12):
+        e = (config.email or {})
+        if not (e.get("user") and e.get("imap_host")):
+            return {"configured": False, "messages": []}
+        try:
+            from .tools.email_ import unread_list
+            return {"configured": True, "user": e.get("user"),
+                    "messages": unread_list(config, limit)}
+        except Exception as ex:
+            return {"configured": True, "error": f"{type(ex).__name__}: {ex}",
+                    "messages": []}
+
+    @app.post("/api/mail/digest")
+    def mail_digest():
+        if "email_digest" not in assistant.registry.names():
+            return {"error": "Email is not configured."}
+        return {"digest": assistant.registry.execute("email_digest", {})}
+
+    # ── Automations: scheduled tasks (list / cancel) ─────────────
+
+    @app.get("/api/tasks")
+    def tasks_list():
+        import time as _t
+        out = []
+        for tid, due_ts, repeat_s, prompt in assistant.memory.enabled_tasks():
+            out.append({"id": tid, "due_ts": due_ts, "repeat_s": repeat_s,
+                        "prompt": prompt,
+                        "due": _t.strftime("%a %H:%M", _t.localtime(due_ts))})
+        out.sort(key=lambda x: x["due_ts"])
+        return {"tasks": out}
+
+    @app.post("/api/tasks/cancel")
+    def tasks_cancel(body: dict):
+        tid = int(body.get("id") or 0)
+        return {"message": assistant.scheduler.cancel(tid)}
+
+    @app.post("/api/tasks/add")
+    def tasks_add(body: dict):
+        when = (body.get("when") or "").strip()
+        prompt = (body.get("prompt") or "").strip()
+        if not when or not prompt:
+            return {"error": "Need both 'when' and 'prompt'."}
+        return {"message": assistant.scheduler.schedule(when, prompt)}
 
     @app.get("/api/models/list")
     def models_list():
@@ -316,6 +482,53 @@ body{
 }
 .role-btns button:hover{color:#5bf;border-color:#5bf}
 .role-btns button.active{color:#5a5;border-color:#5a5}
+
+/* memory panel */
+.mem-note{color:#555;font-size:11px;margin:0 0 10px}
+.mem-row{display:flex;align-items:center;gap:10px;padding:4px 8px;border-radius:3px}
+.mem-row:hover{background:#1a1a1a}
+.mem-row .mk{color:#7ab;min-width:120px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mem-row .mv{color:#aaa;flex:1;word-break:break-word}
+.mem-x{
+  font-size:10px;padding:1px 7px;background:none;border:1px solid #333;
+  color:#666;border-radius:2px;cursor:pointer;font:inherit;flex-shrink:0;
+}
+.mem-x:hover{color:#c55;border-color:#c55}
+.mem-add{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap}
+.mem-add input{
+  background:#0c0c0c;border:1px solid #222;color:#c8c8c8;
+  border-radius:3px;padding:4px 8px;font:inherit;font-size:11px;outline:none;
+}
+.mem-add input:focus{border-color:#333}
+.mem-add button{
+  background:none;border:1px solid #222;color:#666;border-radius:3px;
+  padding:4px 10px;cursor:pointer;font:inherit;font-size:11px;
+}
+.mem-add button:hover{color:#ccc;border-color:#444}
+
+/* sessions panel */
+.sess-row{display:flex;align-items:center;gap:10px;padding:5px 8px;border-radius:3px;cursor:pointer}
+.sess-row:hover{background:#1a1a1a}
+.sess-row.current{background:#16202c}
+.sess-row .st{color:#aaa;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sess-row .sd{color:#555;font-size:10px;flex-shrink:0}
+.sess-row .sc{color:#444;font-size:10px;min-width:44px;text-align:right;flex-shrink:0}
+
+/* attachments */
+.attach-row{max-width:680px;margin:0 auto 6px;display:flex;gap:6px;flex-wrap:wrap}
+.attach-chip{
+  display:flex;align-items:center;gap:7px;font-size:11px;color:#9ab;
+  background:#141a20;border:1px solid #223;border-radius:3px;padding:2px 9px;
+}
+.attach-chip .ax{cursor:pointer;color:#666;font-size:12px}
+.attach-chip .ax:hover{color:#c55}
+#attachbtn{
+  background:#1a1a1a;color:#666;border:none;border-radius:4px;
+  padding:8px 12px;cursor:pointer;font:inherit;font-size:13px;
+  transition:all .15s;flex-shrink:0;
+}
+#attachbtn:hover{background:#222;color:#ccc}
+.composer.drag{outline:1px dashed #5bf;outline-offset:-4px}
 
 /* chat area */
 #chat{flex:1;overflow-y:auto;padding:20px 0}
@@ -486,9 +699,9 @@ body{
   font-size:10px;color:#333;text-align:center;
 }
 
-/* workspace panel */
+/* IDE panel */
 .ws{
-  position:fixed;top:0;right:0;bottom:0;width:520px;max-width:100%;
+  position:fixed;top:0;right:0;bottom:0;width:min(1080px,100%);
   background:#101010;border-left:1px solid #222;z-index:20;
   display:flex;flex-direction:column;
   transform:translateX(100%);transition:transform .25s ease;
@@ -509,17 +722,22 @@ body{
   padding:3px 9px;cursor:pointer;font:inherit;font-size:11px;transition:all .15s;
 }
 .ws button:hover{color:#ccc;border-color:#444}
-.ws-body{flex:1;display:flex;flex-direction:column;overflow:hidden}
-.ws-list{flex:1;overflow-y:auto;padding:6px 0}
+.ws button.on{color:#5bf;border-color:#5bf}
+.ws-body{flex:1;display:flex;overflow:hidden}
+.ws-tree{
+  width:230px;min-width:150px;flex-shrink:0;overflow-y:auto;
+  border-right:1px solid #1e1e1e;padding:6px 0;
+}
 .ws-row{
   padding:3px 14px;cursor:pointer;font-size:12px;color:#888;
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
 }
 .ws-row:hover{background:#181818;color:#ccc}
 .ws-row.dir{color:#7ab}
+.ws-row.active{background:#1a2230;color:#9cf}
 .ws-row .fsize{color:#444;font-size:10px;margin-left:8px}
 .ws-err{color:#c44;font-size:12px;padding:10px 14px}
-.ws-edit{flex:1;display:flex;flex-direction:column;overflow:hidden}
+.ws-main{flex:1;display:flex;flex-direction:column;overflow:hidden}
 .ws-file-bar{
   display:flex;align-items:center;gap:6px;padding:6px 12px;
   border-bottom:1px solid #1e1e1e;flex-shrink:0;
@@ -529,12 +747,126 @@ body{
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
 }
 .ws-file-bar .dirty{color:#db4}
+.ws-split{flex:1;display:flex;overflow:hidden}
 #wstext{
-  flex:1;background:#0c0c0c;color:#c8c8c8;border:none;outline:none;
+  flex:1;min-width:0;background:#0c0c0c;color:#c8c8c8;border:none;outline:none;
   padding:10px 14px;font:inherit;font-size:13px;line-height:1.5;
   resize:none;white-space:pre;tab-size:4;
 }
+/* diff pane: shown beside the code when a change is selected */
+.ws-diff{
+  flex:1;min-width:0;display:none;overflow:auto;
+  border-left:1px solid #1e1e1e;background:#0c0c0c;
+  font-size:12px;line-height:1.5;padding:8px 0;
+}
+.ws-diff.open{display:block}
+.diff-line{white-space:pre;padding:0 12px}
+.diff-add{background:rgba(60,170,90,.13);color:#8d9}
+.diff-del{background:rgba(200,70,70,.11);color:#d88}
+.diff-hunk{color:#69c;background:#0f1722;margin:4px 0;padding:1px 12px}
+.diff-file{color:#777}
+/* changes strip: every file the agent touched this session */
+.ws-changes{
+  border-top:1px solid #1e1e1e;max-height:150px;overflow-y:auto;
+  flex-shrink:0;background:#0e0e0e;
+}
+.ws-changes .chg-head{
+  font-size:10px;color:#555;text-transform:uppercase;letter-spacing:1px;
+  padding:5px 12px 2px;
+}
+.chg-row{
+  display:flex;align-items:center;gap:8px;padding:3px 12px;
+  font-size:11px;color:#888;cursor:pointer;
+}
+.chg-row:hover{background:#181818;color:#ccc}
+.chg-row.active{background:#1a2230}
+.chg-row .chg-path{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.chg-row .chg-time{color:#444;font-size:10px}
+.chg-add{color:#5a5}
+.chg-del{color:#c55}
+.badge{
+  background:#5bf;color:#000;border-radius:8px;
+  font-size:9px;padding:0 5px;margin-left:5px;vertical-align:1px;
+}
+/* file-edit line in chat */
+.tool.edit{cursor:pointer;border-left-color:#2a4a3a}
+.tool.edit:hover{background:#121a14}
 
+/* ── shared panel polish: search + actions row ─────────────── */
+.panel-tools{display:flex;gap:8px;align-items:center;margin:0 0 12px;flex-wrap:wrap}
+.panel-tools input.search{
+  flex:1;min-width:140px;background:#0c0c0c;border:1px solid #222;color:#c8c8c8;
+  border-radius:4px;padding:5px 10px;font:inherit;font-size:12px;outline:none;
+}
+.panel-tools input.search:focus{border-color:#3a5}
+.panel-tools .pbtn{
+  background:none;border:1px solid #222;color:#777;border-radius:4px;
+  padding:5px 11px;cursor:pointer;font:inherit;font-size:11px;transition:all .15s;
+}
+.panel-tools .pbtn:hover{color:#ccc;border-color:#444}
+.panel-tools .pbtn.accent{color:#5bf;border-color:#244}
+.panel-tools .pbtn.accent:hover{border-color:#5bf}
+
+/* ── hardware dashboard ────────────────────────────────────── */
+#hwpanel.open{max-height:88vh}
+#hwpanel .model-panel-inner{max-height:84vh}
+.hw-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}
+.hw-card{
+  border:1px solid #1c1c1c;border-radius:6px;padding:11px 13px;background:#0d0d0d;
+}
+.hw-card .hw-top{display:flex;justify-content:space-between;align-items:baseline}
+.hw-card .hw-label{font-size:10px;text-transform:uppercase;letter-spacing:1px;color:#666}
+.hw-card .hw-sub{font-size:10px;color:#555}
+.hw-card .hw-val{font-size:23px;color:#dcdcdc;margin:3px 0 7px;font-weight:bold;letter-spacing:.5px}
+.hw-card .hw-val small{font-size:12px;color:#777;font-weight:normal}
+.hw-bar{height:6px;background:#1a1a1a;border-radius:3px;overflow:hidden}
+.hw-bar > i{display:block;height:100%;border-radius:3px;transition:width .4s ease,background .4s}
+.hw-bar.cool > i{background:#3a8}
+.hw-bar.warm > i{background:#db4}
+.hw-bar.hot  > i{background:#c55}
+.hw-spark{width:100%;height:34px;display:block;margin-top:8px}
+
+.hw-section-h{font-size:10px;text-transform:uppercase;letter-spacing:1px;color:#555;margin:16px 0 8px}
+.hw-cores{display:grid;grid-template-columns:repeat(auto-fill,minmax(46px,1fr));gap:5px}
+.hw-core{font-size:9px;color:#666;text-align:center}
+.hw-core .cbar{height:30px;width:100%;background:#161616;border-radius:2px;position:relative;overflow:hidden;margin-bottom:2px}
+.hw-core .cbar > i{position:absolute;bottom:0;left:0;right:0;background:#3a8;transition:height .4s,background .4s}
+
+.hw-proc{width:100%;font-size:12px;border-collapse:collapse;margin-top:4px}
+.hw-proc td{padding:3px 8px;border-bottom:1px solid #161616;color:#9a9a9a}
+.hw-proc td.n{color:#bbb}
+.hw-proc td.r{text-align:right;color:#888;font-variant-numeric:tabular-nums}
+
+.hw-advice{
+  margin-top:14px;border:1px solid #1d2a1d;border-radius:6px;background:#0c110c;
+  padding:12px 14px;font-size:13px;color:#bcd;line-height:1.6;
+}
+.hw-advice .ha-head{font-size:10px;text-transform:uppercase;letter-spacing:1px;color:#5a5;margin-bottom:6px}
+.hw-advice ul{margin:0;padding-left:18px}
+.hw-advice li{margin:3px 0}
+
+/* ── mail panel ────────────────────────────────────────────── */
+.mail-row{display:flex;gap:10px;align-items:baseline;padding:6px 8px;border-radius:4px;border-bottom:1px solid #161616}
+.mail-row:hover{background:#161616}
+.mail-row .mfrom{color:#9bd;min-width:160px;max-width:200px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12px}
+.mail-row .msubj{flex:1;color:#bbb;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mail-row .macts{display:flex;gap:4px;opacity:0;transition:opacity .15s}
+.mail-row:hover .macts{opacity:1}
+.mail-row .macts button{font-size:9px;padding:1px 7px;background:none;border:1px solid #2a3340;color:#789;border-radius:2px;cursor:pointer;font:inherit}
+.mail-row .macts button:hover{color:#9cf;border-color:#5bf}
+
+/* ── automations / tasks ───────────────────────────────────── */
+.task-row{display:flex;gap:10px;align-items:center;padding:6px 8px;border-radius:4px;border-bottom:1px solid #161616}
+.task-row:hover{background:#161616}
+.task-row .tdue{color:#7ab;font-size:11px;min-width:92px;font-variant-numeric:tabular-nums}
+.task-row .trepeat{color:#b90;font-size:9px}
+.task-row .tprompt{flex:1;color:#bbb;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+@media(max-width:760px){
+  .ws-tree{display:none}
+  .ws-split{flex-direction:column}
+  .ws-diff{border-left:none;border-top:1px solid #1e1e1e}
+}
 @media(max-width:600px){
   .welcome .caps{grid-template-columns:1fr}
   .topbar{gap:6px;padding:6px 10px}
@@ -549,34 +881,52 @@ body{
   <span class="name">JARVIS</span>
   <span class="sep">/</span>
   <span class="status" id="chip">starting&hellip;</span>
-  <button id="wsbtn" title="browse and edit files">files</button>
+  <button id="wsbtn" title="code editor with live agent diffs">ide<span class="badge" id="wsbadge" style="display:none">0</span></button>
+  <button id="sessbtn" title="browse past conversations">chats</button>
+  <button id="membtn" title="what jarvis remembers about you">memory</button>
   <button id="modelsbtn" title="switch models">models</button>
+  <button id="hwbtn" title="hardware dashboard with AI recommendations">hardware</button>
+  <button id="mailbtn" title="gmail inbox &amp; automation">mail</button>
+  <button id="tasksbtn" title="scheduled automations">tasks</button>
   <button id="infobtn" title="system info">info</button>
   <button id="micbtn" title="toggle voice">voice</button>
+  <button id="exportbtn" title="download this chat as markdown">export</button>
   <button id="newbtn" title="new session">new</button>
 </div>
 
 <div class="ws" id="ws">
   <div class="ws-head">
-    <span class="ws-title">workspace</span>
+    <span class="ws-title">ide</span>
     <input id="wspath" spellcheck="false" placeholder="path...">
     <button id="wsclose">close</button>
   </div>
   <div class="ws-body">
-    <div class="ws-list" id="wslist"></div>
-    <div class="ws-edit" id="wsedit" style="display:none">
+    <div class="ws-tree" id="wstree"></div>
+    <div class="ws-main">
       <div class="ws-file-bar">
-        <span id="wsfile"></span>
+        <span id="wsfile">select a file from the tree</span>
+        <button id="wsdiffbtn" style="display:none" title="toggle the diff pane">diff</button>
         <button id="wsask" title="reference this file in chat">ask jarvis</button>
         <button id="wssave">save</button>
-        <button id="wsback">back</button>
       </div>
-      <textarea id="wstext" spellcheck="false"></textarea>
+      <div class="ws-split">
+        <textarea id="wstext" spellcheck="false" placeholder=""></textarea>
+        <div class="ws-diff" id="wsdiff"></div>
+      </div>
+      <div class="ws-changes" id="wschanges" style="display:none">
+        <div class="chg-head">changes by jarvis</div>
+        <div id="wschglist"></div>
+      </div>
     </div>
   </div>
 </div>
 
 <div class="model-panel" id="modelpanel"><div class="model-panel-inner" id="modellist">loading...</div></div>
+<div class="model-panel" id="mempanel"><div class="model-panel-inner" id="memlist">loading...</div></div>
+<div class="model-panel" id="sesspanel"><div class="model-panel-inner" id="sesslist">loading...</div></div>
+<div class="model-panel" id="hwpanel"><div class="model-panel-inner" id="hwbody">loading...</div></div>
+<div class="model-panel" id="mailpanel"><div class="model-panel-inner" id="mailbody">loading...</div></div>
+<div class="model-panel" id="taskspanel"><div class="model-panel-inner" id="tasksbody">loading...</div></div>
 <div class="drawer" id="drawer"><div class="drawer-inner" id="dinfo"></div></div>
 
 <div id="chat">
@@ -627,17 +977,28 @@ body{
           <div class="cap-title">files &amp; code</div>
           <div class="cap-desc">read, write, edit files, run commands</div>
         </div>
+        <div class="cap" onclick="document.getElementById('hwbtn').click()">
+          <div class="cap-title">hardware</div>
+          <div class="cap-desc">live CPU/GPU/RAM dashboard + AI tuning advice</div>
+        </div>
+        <div class="cap" onclick="q('give me an AI digest of my unread email')">
+          <div class="cap-title">gmail</div>
+          <div class="cap-desc">triage, digest, draft replies, scheduled sends</div>
+        </div>
       </div>
     </div>
   </div>
 </div>
 
-<div class="composer">
+<div class="composer" id="composer">
+  <div class="attach-row" id="attachrow" style="display:none"></div>
   <div class="compose-row">
+    <button id="attachbtn" title="attach a pdf, image, or text file">+</button>
     <textarea id="box" rows="1" placeholder="message jarvis&hellip;"></textarea>
     <button id="sendbtn">send</button>
   </div>
-  <div class="compose-hint">enter to send &middot; shift+enter for newline</div>
+  <div class="compose-hint">enter to send &middot; shift+enter for newline &middot; + or drop a file to attach</div>
+  <input type="file" id="fileinput" multiple style="display:none">
 </div>
 
 <script>
@@ -650,8 +1011,19 @@ var log=document.getElementById("log"),
     newbtn=document.getElementById("newbtn"),
     infobtn=document.getElementById("infobtn"),
     modelsbtn=document.getElementById("modelsbtn"),
+    membtn=document.getElementById("membtn"),
+    sessbtn=document.getElementById("sessbtn"),
     drawer=document.getElementById("drawer"),
     modelpanel=document.getElementById("modelpanel"),
+    mempanel=document.getElementById("mempanel"),
+    memlist=document.getElementById("memlist"),
+    sesspanel=document.getElementById("sesspanel"),
+    sesslist=document.getElementById("sesslist"),
+    composer=document.getElementById("composer"),
+    attachbtn=document.getElementById("attachbtn"),
+    attachrow=document.getElementById("attachrow"),
+    fileinput=document.getElementById("fileinput"),
+    attachments=[],
     modellist=document.getElementById("modellist"),
     dinfo=document.getElementById("dinfo"),
     wel=document.getElementById("welcome"),
@@ -763,9 +1135,10 @@ function tok(t){
   scroll();
 }
 
-function addTool(html){
-  var d=document.createElement("div");d.className="tool";d.innerHTML=html;
+function addTool(html,cls){
+  var d=document.createElement("div");d.className="tool"+(cls?" "+cls:"");d.innerHTML=html;
   (cur?cur.el:log).appendChild(d);scroll();
+  return d;
 }
 
 function banner(cls,icon,txt){
@@ -791,6 +1164,8 @@ es.onmessage=function(m){
       addTool('<span class="fn">'+esc(ev.name)+'</span> '+esc(String(ev.args)));break;
     case"tool_result":
       addTool('<span class="res">  '+esc(String(ev.preview||""))+'</span>');break;
+    case"file_edit":
+      onFileEdit(ev,true);break;
     case"done":
       if(cur&&cur.tid===ev.turn_id){
         closeThink(true);
@@ -809,6 +1184,10 @@ es.onmessage=function(m){
       if(cur){closeThink(true);cur.body.classList.remove("typing");cur=null}
       banner("err-banner","!",ev.text);setBusy(false);break;
     case"notify":banner("note","*",ev.text);break;
+    case"memory":
+      banner("note","*","remembered: "+ev.text);
+      if(mempanel.classList.contains("open"))loadMemory();
+      break;
     case"voice":voiceUI(ev.state);break;
   }
 };
@@ -830,7 +1209,7 @@ function refreshStatus(){
       '<div class="col"><div class="lbl">stats</div>'+
         '<div class="val"><b>'+s.models+'</b> models</div>'+
         '<div class="val"><b>'+s.tools+'</b> tools</div>'+
-        '<div class="val"><b>'+s.facts+'</b> facts</div></div>'+
+        '<div class="val"><b>'+s.facts+'</b> facts / <b>'+(s.profile||0)+'</b> profile</div></div>'+
       '<div class="col"><div class="lbl">voice</div>'+
         '<div class="val">'+(s.voice?"on":"off")+'</div>'+
         '<div class="lbl" style="margin-top:6px">speak</div>'+
@@ -852,32 +1231,62 @@ function voiceUI(st){
   else{micbtn.textContent="voice"}
 }
 
-/* model switcher */
-function loadModels(){
-  fetch("/api/models/list").then(function(r){return r.json()}).then(function(data){
-    var models=data.models||[];
-    var routes=data.routes||{};
-    if(!models.length){modellist.innerHTML="<span style='color:#555'>no models found</span>";return}
-    var html="<h3>click a role button to assign a model</h3>";
-    models.forEach(function(m){
+/* model switcher — with search + refresh */
+var _modelData=null,_modelFilter="";
+function loadModels(refresh){
+  modellist.innerHTML="loading...";
+  fetch("/api/models/list"+(refresh?"?":"")).then(function(r){return r.json()}).then(function(data){
+    _modelData=data;renderModels();
+    if(refresh){fetch("/api/models?refresh=1").then(function(){return fetch("/api/models/list")})
+      .then(function(r){return r.json()}).then(function(d){_modelData=d;renderModels()}).catch(function(){})}
+  }).catch(function(){modellist.innerHTML="<span style='color:#c44'>failed to load</span>"});
+}
+function renderModels(){
+  if(!_modelData){return}
+  var models=_modelData.models||[],routes=_modelData.routes||{};
+  var tools=document.createElement("div");tools.className="panel-tools";
+  var search=document.createElement("input");search.className="search";
+  search.placeholder="filter models...";search.value=_modelFilter;
+  search.oninput=function(){_modelFilter=search.value;renderRows();search.focus()};
+  var rb=document.createElement("button");rb.className="pbtn accent";rb.textContent="rescan";
+  rb.onclick=function(){loadModels(true)};
+  tools.appendChild(search);tools.appendChild(rb);
+  var routeInfo=document.createElement("div");routeInfo.className="hw-sub";
+  routeInfo.style.cssText="font-size:11px;color:#666;margin-bottom:8px";
+  routeInfo.innerHTML="active: chat <b style='color:#9cf'>"+esc(routes.chat||"-")+
+    "</b> &middot; code <b style='color:#9cf'>"+esc(routes.code||"-")+
+    "</b> &middot; vision <b style='color:#9cf'>"+esc(routes.vision||"-")+"</b>";
+  var h=document.createElement("h3");h.textContent="click a role button to pin a model";
+  var rows=document.createElement("div");rows.id="modelrows";
+  modellist.innerHTML="";
+  modellist.appendChild(tools);modellist.appendChild(routeInfo);
+  modellist.appendChild(h);modellist.appendChild(rows);
+  renderRows();
+  function renderRows(){
+    var rowsEl=document.getElementById("modelrows");
+    var f=_modelFilter.toLowerCase();
+    var shown=models.filter(function(m){
+      return !f||m.name.toLowerCase().indexOf(f)>=0||m.caps.join(" ").indexOf(f)>=0;
+    });
+    if(!shown.length){rowsEl.innerHTML="<span style='color:#555'>no match</span>";return}
+    var html="";
+    shown.forEach(function(m){
       var tags=[];
       ["chat","code","vision"].forEach(function(role){
         if(routes[role]===m.name)tags.push('<span class="mtag">'+role+'</span>');
       });
-      html+='<div class="model-row">';
-      html+='<span class="mname">'+esc(m.name)+'</span>';
+      html+='<div class="model-row"><span class="mname">'+esc(m.name)+'</span>';
       html+=tags.join(" ");
       html+='<span class="mcaps">'+m.caps.join(", ")+'</span>';
-      html+='<span class="msize">'+esc(m.size)+'</span>';
-      html+='<span class="role-btns">';
+      html+='<span class="msize">'+esc(m.size)+'</span><span class="role-btns">';
       ["chat","code","vision"].forEach(function(role){
         var cls=routes[role]===m.name?" active":"";
         html+='<button class="'+cls+'" onclick="setRole(\''+role+'\',\''+m.name.replace(/'/g,"\\'")+'\')">'+role+'</button>';
       });
       html+='</span></div>';
     });
-    modellist.innerHTML=html;
-  }).catch(function(){modellist.innerHTML="<span style='color:#c44'>failed to load</span>"});
+    rowsEl.innerHTML=html;
+  }
 }
 
 function setRole(role,name){
@@ -888,6 +1297,351 @@ function setRole(role,name){
     }).catch(function(){});
 }
 
+/* ── hardware dashboard ────────────────────────────────────── */
+var _hwBuilt=false,_hwHist={cpu:[],ram:[],gpu:[]};
+function barClass(pct,warm,hot){
+  warm=warm||70;hot=hot||88;
+  return pct>=hot?"hot":pct>=warm?"warm":"cool";
+}
+function hwCard(label,sub,valueHtml,pct,warm,hot){
+  var w=Math.max(0,Math.min(100,pct||0));
+  return '<div class="hw-card"><div class="hw-top">'+
+    '<span class="hw-label">'+label+'</span>'+
+    '<span class="hw-sub">'+(sub||"")+'</span></div>'+
+    '<div class="hw-val">'+valueHtml+'</div>'+
+    '<div class="hw-bar '+barClass(w,warm,hot)+'"><i style="width:'+w+'%"></i></div></div>';
+}
+function buildHwSkeleton(){
+  hwbody.innerHTML=
+    '<div class="panel-tools">'+
+      '<button class="pbtn accent" id="hwadvbtn">✨ AI recommendations</button>'+
+      '<button class="pbtn" id="hwroastbtn">🔥 roast my PC</button>'+
+      '<span class="hw-sub" id="hwts" style="margin-left:auto"></span>'+
+    '</div>'+
+    '<div class="hw-grid" id="hwgauges"></div>'+
+    '<div class="hw-section-h">cpu cores</div><div class="hw-cores" id="hwcores"></div>'+
+    '<div class="hw-grid" style="margin-top:14px">'+
+      '<div class="hw-card"><span class="hw-label">cpu history</span><canvas class="hw-spark" id="sparkcpu"></canvas></div>'+
+      '<div class="hw-card"><span class="hw-label">ram history</span><canvas class="hw-spark" id="sparkram"></canvas></div>'+
+    '</div>'+
+    '<div class="hw-section-h">top processes by ram</div><table class="hw-proc" id="hwproc"></table>'+
+    '<div id="hwadvice"></div>';
+  document.getElementById("hwadvbtn").onclick=hwRecommend;
+  document.getElementById("hwroastbtn").onclick=hwRoast;
+  _hwBuilt=true;
+}
+function loadHardware(){
+  if(!_hwBuilt)buildHwSkeleton();
+  fetch("/api/hardware").then(function(r){return r.json()}).then(function(s){
+    if(s.error){hwbody.innerHTML='<span style="color:#c44">'+esc(s.error)+'</span>';_hwBuilt=false;return}
+    hwUpdate(s);
+  }).catch(function(){});
+}
+function pushHist(key,v){var a=_hwHist[key];a.push(v);if(a.length>80)a.shift()}
+function drawSpark(id,data,warm,hot){
+  var c=document.getElementById(id);if(!c)return;
+  var w=c.offsetWidth||300,h=34;c.width=w;c.height=h;
+  var ctx=c.getContext("2d");ctx.clearRect(0,0,w,h);
+  if(data.length<2)return;
+  var last=data[data.length-1];
+  var col=last>=(hot||88)?"#c55":last>=(warm||70)?"#db4":"#3a8";
+  var step=w/(data.length-1);
+  ctx.beginPath();
+  data.forEach(function(v,i){var y=h-(v/100)*h;i?ctx.lineTo(i*step,y):ctx.moveTo(0,y)});
+  /* fill under the line */
+  ctx.lineTo((data.length-1)*step,h);ctx.lineTo(0,h);ctx.closePath();
+  ctx.globalAlpha=0.12;ctx.fillStyle=col;ctx.fill();ctx.globalAlpha=1;
+  /* stroke the line on top */
+  ctx.beginPath();
+  data.forEach(function(v,i){var y=h-(v/100)*h;i?ctx.lineTo(i*step,y):ctx.moveTo(0,y)});
+  ctx.strokeStyle=col;ctx.lineWidth=1.5;ctx.stroke();
+}
+function hwUpdate(s){
+  var g="",cpu=s.cpu||{},mem=s.memory||{};
+  /* CPU */
+  var cpuSub=(cpu.freq_mhz?Math.round(cpu.freq_mhz)+" MHz":"")+
+    (cpu.temp_c?" · "+Math.round(cpu.temp_c)+"°C":"");
+  g+=hwCard("cpu",cpuSub,Math.round(cpu.percent||0)+'<small>%</small>',cpu.percent,75,92);
+  /* RAM */
+  g+=hwCard("memory",(mem.used_gb||0)+" / "+(mem.total_gb||0)+" GB",
+    Math.round(mem.percent||0)+'<small>%</small>',mem.percent,75,90);
+  /* GPU(s) */
+  (s.gpus||[]).forEach(function(gp){
+    var sub=[];if(gp.temp!=null)sub.push(Math.round(gp.temp)+"°C");
+    if(gp.power_w!=null)sub.push(Math.round(gp.power_w)+"W");
+    var vram=(gp.mem_used_mb&&gp.mem_total_mb)?
+      ' <small>'+(gp.mem_used_mb/1024).toFixed(1)+'/'+(gp.mem_total_mb/1024).toFixed(1)+'GB</small>':'';
+    g+=hwCard("gpu · "+esc(gp.name.slice(0,22)),sub.join(" · "),
+      Math.round(gp.util||0)+'<small>%</small>'+vram,gp.util,75,92);
+  });
+  /* primary disk */
+  if(s.disks&&s.disks.length){
+    var d=s.disks[0];
+    g+=hwCard("disk "+esc(d.device),d.free_gb+" GB free",
+      Math.round(d.percent)+'<small>%</small>',d.percent,80,92);
+  }
+  /* temp card if we have a CPU temp */
+  if(cpu.temp_c){
+    g+=hwCard("cpu temp","thermal",Math.round(cpu.temp_c)+'<small>°C</small>',
+      cpu.temp_c,70,85);
+  }
+  /* battery */
+  if(s.battery){
+    g+=hwCard("battery",s.battery.plugged?"charging":"on battery",
+      Math.round(s.battery.percent)+'<small>%</small>',s.battery.percent,100,101);
+  }
+  document.getElementById("hwgauges").innerHTML=g;
+  /* per-core */
+  var cores="";
+  (cpu.per_core||[]).forEach(function(v,i){
+    var cls=v>=92?"#c55":v>=75?"#db4":"#3a8";
+    cores+='<div class="hw-core"><div class="cbar"><i style="height:'+v+'%;background:'+cls+'"></i></div>'+
+      Math.round(v)+'</div>';
+  });
+  document.getElementById("hwcores").innerHTML=cores;
+  /* sparklines */
+  pushHist("cpu",cpu.percent||0);pushHist("ram",mem.percent||0);
+  drawSpark("sparkcpu",_hwHist.cpu,75,92);drawSpark("sparkram",_hwHist.ram,75,90);
+  /* processes */
+  var pr="";
+  (s.top_ram||[]).forEach(function(p){
+    pr+='<tr><td class="n">'+esc(p.name)+'</td><td class="r">'+
+      (p.ram_mb>=1024?(p.ram_mb/1024).toFixed(1)+" GB":Math.round(p.ram_mb)+" MB")+
+      '</td><td class="r">'+Math.round(p.cpu)+'%</td></tr>';
+  });
+  document.getElementById("hwproc").innerHTML=pr;
+  var ts=document.getElementById("hwts");
+  if(ts)ts.textContent="up "+(s.uptime_h||0)+"h · live";
+}
+function hwRecommend(){
+  var box=document.getElementById("hwadvice");
+  box.innerHTML='<div class="hw-advice"><div class="ha-head">analysing...</div>'+
+    '<span class="dots"><span></span><span></span><span></span></span></div>';
+  fetch("/api/hardware/recommend",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"})
+    .then(function(r){return r.json()}).then(function(d){
+      if(d.error){box.innerHTML='<div class="hw-advice">'+esc(d.error)+'</div>';return}
+      box.innerHTML='<div class="hw-advice"><div class="ha-head">✨ AI recommendations</div>'+md(d.advice||"")+'</div>';
+    }).catch(function(){box.innerHTML='<div class="hw-advice">failed to get recommendations</div>'});
+}
+function hwRoast(){
+  var box=document.getElementById("hwadvice");
+  box.innerHTML='<div class="hw-advice"><div class="ha-head">🔥 warming up...</div></div>';
+  fetch("/api/roast").then(function(r){return r.json()}).then(function(d){
+    box.innerHTML='<div class="hw-advice"><div class="ha-head">🔥 the roast</div>'+
+      esc(d.roast||d.error||"")+'</div>';
+  }).catch(function(){box.innerHTML='<div class="hw-advice">no roast today</div>'});
+}
+
+/* ── mail panel ────────────────────────────────────────────── */
+function loadMail(){
+  mailbody.innerHTML="loading...";
+  fetch("/api/mail?limit=15").then(function(r){return r.json()}).then(function(d){
+    mailbody.innerHTML="";
+    var tools=document.createElement("div");tools.className="panel-tools";
+    if(!d.configured){
+      mailbody.innerHTML='<div class="mem-note">Gmail not configured. Add an '+
+        '<b>email</b> block to <code>~/.jarvis/config.json</code> '+
+        '(imap_host, smtp_host, user, app-password) and restart.</div>';
+      return;
+    }
+    var dg=document.createElement("button");dg.className="pbtn accent";dg.textContent="✨ AI digest";
+    dg.onclick=mailDigest;
+    var rf=document.createElement("button");rf.className="pbtn";rf.textContent="refresh";
+    rf.onclick=loadMail;
+    var who=document.createElement("span");who.className="hw-sub";who.style.marginLeft="auto";
+    who.textContent=d.user||"";
+    tools.appendChild(dg);tools.appendChild(rf);tools.appendChild(who);
+    mailbody.appendChild(tools);
+    var dbox=document.createElement("div");dbox.id="maildigest";mailbody.appendChild(dbox);
+    if(d.error){
+      var e=document.createElement("div");e.className="mem-note";e.style.color="#c44";
+      e.textContent=d.error;mailbody.appendChild(e);
+    }
+    var msgs=d.messages||[];
+    if(!msgs.length){
+      var z=document.createElement("div");z.className="mem-note";z.textContent="inbox is clear — no unread mail.";
+      mailbody.appendChild(z);return;
+    }
+    var h=document.createElement("div");h.className="hw-section-h";h.textContent=msgs.length+" unread";
+    mailbody.appendChild(h);
+    msgs.forEach(function(m){
+      var row=document.createElement("div");row.className="mail-row";
+      row.innerHTML='<span class="mfrom">'+esc(m.from)+'</span>'+
+        '<span class="msubj">'+esc(m.subject)+'</span>'+
+        '<span class="macts"><button data-a="read">read</button>'+
+        '<button data-a="reply">reply</button></span>';
+      row.querySelectorAll(".macts button").forEach(function(b){
+        b.onclick=function(){
+          var a=b.getAttribute("data-a");
+          if(a==="read"){q("Read email #"+m.id+" and summarize it.")}
+          else{box.value="Draft a reply to email #"+m.id+": ";box.focus()}
+          togglePanel(mailpanel);
+        };
+      });
+      mailbody.appendChild(row);
+    });
+  }).catch(function(){mailbody.innerHTML="<span style='color:#c44'>failed to load mail</span>"});
+}
+function mailDigest(){
+  var box=document.getElementById("maildigest");
+  box.innerHTML='<div class="hw-advice"><div class="ha-head">reading inbox...</div>'+
+    '<span class="dots"><span></span><span></span><span></span></span></div>';
+  fetch("/api/mail/digest",{method:"POST"}).then(function(r){return r.json()}).then(function(d){
+    box.innerHTML='<div class="hw-advice"><div class="ha-head">✨ inbox digest</div>'+
+      md(d.digest||d.error||"")+'</div>';
+  }).catch(function(){box.innerHTML='<div class="hw-advice">digest failed</div>'});
+}
+
+/* ── automations / scheduled tasks ─────────────────────────── */
+function loadTasks(){
+  tasksbody.innerHTML="loading...";
+  fetch("/api/tasks").then(function(r){return r.json()}).then(function(d){
+    tasksbody.innerHTML="";
+    var note=document.createElement("div");note.className="mem-note";
+    note.textContent="scheduled prompts JARVIS runs on its own. add one below or just ask in chat (\"every morning at 8, summarize my unread email\").";
+    tasksbody.appendChild(note);
+    var add=document.createElement("div");add.className="mem-add";
+    var iw=document.createElement("input");iw.placeholder="when (e.g. at 09:00 / every 2 hours)";iw.style.width="220px";
+    var ip=document.createElement("input");ip.placeholder="what to do";ip.style.flex="1";ip.style.minWidth="180px";
+    var b=document.createElement("button");b.textContent="schedule";
+    b.onclick=function(){
+      if(!iw.value.trim()||!ip.value.trim())return;
+      fetch("/api/tasks/add",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({when:iw.value.trim(),prompt:ip.value.trim()})})
+        .then(function(r){return r.json()}).then(function(r){
+          banner("note","*",r.message||r.error||"scheduled");loadTasks();
+        }).catch(function(){});
+    };
+    add.appendChild(iw);add.appendChild(ip);add.appendChild(b);
+    tasksbody.appendChild(add);
+    var ts=d.tasks||[];
+    var h=document.createElement("div");h.className="hw-section-h";
+    h.textContent=ts.length?ts.length+" active":"no active automations";
+    tasksbody.appendChild(h);
+    ts.forEach(function(t){
+      var row=document.createElement("div");row.className="task-row";
+      var rep=t.repeat_s?'<span class="trepeat">↻ every '+Math.round(t.repeat_s)+'s</span>':'';
+      row.innerHTML='<span class="tdue">'+esc(t.due)+'</span>'+rep+
+        '<span class="tprompt">'+esc(t.prompt)+'</span>'+
+        '<button class="mem-x">cancel</button>';
+      row.querySelector(".mem-x").onclick=function(){
+        fetch("/api/tasks/cancel",{method:"POST",headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({id:t.id})}).then(function(){loadTasks()}).catch(function(){});
+      };
+      tasksbody.appendChild(row);
+    });
+  }).catch(function(){tasksbody.innerHTML="<span style='color:#c44'>failed to load</span>"});
+}
+
+/* memory panel — what jarvis knows about the user */
+function memPost(url,payload){
+  return fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(payload)}).then(function(r){return r.json()})
+    .then(function(){loadMemory();refreshStatus()}).catch(function(){});
+}
+function memRow(label,value,onDelete){
+  var d=document.createElement("div");d.className="mem-row";
+  var k=document.createElement("span");k.className="mk";k.textContent=label;
+  var v=document.createElement("span");v.className="mv";v.textContent=value;
+  var x=document.createElement("button");x.className="mem-x";x.textContent="forget";
+  x.onclick=onDelete;
+  d.appendChild(k);d.appendChild(v);d.appendChild(x);
+  return d;
+}
+function loadMemory(){
+  fetch("/api/memory").then(function(r){return r.json()}).then(function(d){
+    memlist.innerHTML="";
+    var note=document.createElement("div");note.className="mem-note";
+    note.textContent="learned automatically as you talk; injected into every reply. add or forget entries freely.";
+    memlist.appendChild(note);
+    var h=document.createElement("h3");h.textContent="profile";
+    memlist.appendChild(h);
+    var keys=Object.keys(d.profile||{});
+    if(!keys.length){
+      var e=document.createElement("div");e.className="mem-note";
+      e.textContent="(empty — tell jarvis about yourself)";
+      memlist.appendChild(e);
+    }
+    keys.forEach(function(k){
+      memlist.appendChild(memRow(k,d.profile[k],function(){
+        memPost("/api/memory/profile",{key:k,value:""});
+      }));
+    });
+    var h2=document.createElement("h3");h2.textContent="facts";h2.style.marginTop="12px";
+    memlist.appendChild(h2);
+    var facts=d.facts||[];
+    if(!facts.length){
+      var e2=document.createElement("div");e2.className="mem-note";
+      e2.textContent="(none yet)";
+      memlist.appendChild(e2);
+    }
+    facts.forEach(function(f){
+      memlist.appendChild(memRow(f.topic||"#"+f.id,f.content,function(){
+        memPost("/api/memory/forget",{id:f.id});
+      }));
+    });
+    var add=document.createElement("div");add.className="mem-add";
+    var ik=document.createElement("input");ik.placeholder="key (e.g. name)";ik.style.width="140px";
+    var iv=document.createElement("input");iv.placeholder="value";iv.style.flex="1";iv.style.minWidth="180px";
+    var b=document.createElement("button");b.textContent="add to profile";
+    b.onclick=function(){
+      if(ik.value.trim()&&iv.value.trim()){
+        memPost("/api/memory/profile",{key:ik.value.trim(),value:iv.value.trim()});
+      }
+    };
+    add.appendChild(ik);add.appendChild(iv);add.appendChild(b);
+    memlist.appendChild(add);
+  }).catch(function(){memlist.innerHTML="<span style='color:#c44'>failed to load</span>"});
+}
+
+/* attachments: upload to the server, reference in the message */
+function renderAttach(){
+  attachrow.style.display=attachments.length?"":"none";
+  attachrow.innerHTML="";
+  attachments.forEach(function(p,i){
+    var chip=document.createElement("span");chip.className="attach-chip";
+    var nm=document.createElement("span");nm.textContent=p.split(/[\\\/]/).pop();
+    var x=document.createElement("span");x.className="ax";x.textContent="x";
+    x.title="remove";
+    x.onclick=function(){attachments.splice(i,1);renderAttach()};
+    chip.appendChild(nm);chip.appendChild(x);
+    attachrow.appendChild(chip);
+  });
+}
+function uploadFile(file){
+  if(file.size>25*1024*1024){banner("err-banner","!",file.name+" is too large (25 MB max)");return}
+  var chip=document.createElement("span");chip.className="attach-chip";
+  chip.textContent="uploading "+file.name+"...";
+  attachrow.style.display="";attachrow.appendChild(chip);
+  var rd=new FileReader();
+  rd.onload=function(){
+    var b64=String(rd.result).split(",")[1]||"";
+    fetch("/api/upload",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({name:file.name,data_b64:b64})})
+      .then(function(r){return r.json()}).then(function(d){
+        if(d.error){banner("err-banner","!",d.error);renderAttach();return}
+        attachments.push(d.path);renderAttach();
+      }).catch(function(){renderAttach()});
+  };
+  rd.readAsDataURL(file);
+}
+attachbtn.onclick=function(){fileinput.click()};
+fileinput.onchange=function(){
+  for(var i=0;i<fileinput.files.length;i++)uploadFile(fileinput.files[i]);
+  fileinput.value="";
+};
+["dragover","dragenter"].forEach(function(evn){
+  composer.addEventListener(evn,function(e){e.preventDefault();composer.classList.add("drag")});
+});
+["dragleave","dragend"].forEach(function(evn){
+  composer.addEventListener(evn,function(){composer.classList.remove("drag")});
+});
+composer.addEventListener("drop",function(e){
+  e.preventDefault();composer.classList.remove("drag");
+  var fs=e.dataTransfer&&e.dataTransfer.files;
+  if(fs)for(var i=0;i<fs.length;i++)uploadFile(fs[i]);
+});
+
 /* send / stop */
 function setBusy(b){
   busy=b;
@@ -896,7 +1650,13 @@ function setBusy(b){
 }
 function send(){
   if(busy)return;
-  var t=box.value.trim();if(!t)return;
+  var t=box.value.trim();
+  if(!t&&!attachments.length)return;
+  if(attachments.length){
+    var pre=attachments.map(function(p){return "[Attached file: "+p+"]"}).join("\n");
+    t=pre+"\n"+(t||"Read the attached file(s) and summarize the contents.");
+    attachments=[];renderAttach();
+  }
   box.value="";box.style.height="auto";setBusy(true);
   fetch("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:t})})
     .catch(function(){setBusy(false)});
@@ -919,6 +1679,9 @@ micbtn.onclick=function(){
     .catch(function(){});
 };
 
+/* export chat */
+document.getElementById("exportbtn").onclick=function(){window.location="/api/export"};
+
 /* new session */
 newbtn.onclick=function(){
   fetch("/api/session/new",{method:"POST"}).then(function(){
@@ -926,47 +1689,113 @@ newbtn.onclick=function(){
   }).catch(function(){});
 };
 
-/* drawer toggles */
-infobtn.onclick=function(){
-  drawer.classList.toggle("open");
-  if(modelpanel.classList.contains("open"))modelpanel.classList.remove("open");
-};
-modelsbtn.onclick=function(){
-  modelpanel.classList.toggle("open");
-  if(drawer.classList.contains("open"))drawer.classList.remove("open");
-  if(modelpanel.classList.contains("open"))loadModels();
-};
+/* drawer toggles (mutually exclusive) */
+var hwpanel=document.getElementById("hwpanel"),
+    hwbody=document.getElementById("hwbody"),
+    mailpanel=document.getElementById("mailpanel"),
+    mailbody=document.getElementById("mailbody"),
+    taskspanel=document.getElementById("taskspanel"),
+    tasksbody=document.getElementById("tasksbody"),
+    hwbtn=document.getElementById("hwbtn"),
+    mailbtn=document.getElementById("mailbtn"),
+    tasksbtn=document.getElementById("tasksbtn"),
+    hwTimer=null;
+var ALL_PANELS=[drawer,modelpanel,mempanel,sesspanel,hwpanel,mailpanel,taskspanel];
+function togglePanel(panel,onOpen){
+  ALL_PANELS.forEach(function(p){if(p!==panel)p.classList.remove("open")});
+  panel.classList.toggle("open");
+  var open=panel.classList.contains("open");
+  /* hardware polls live only while its panel is open */
+  if(hwTimer){clearInterval(hwTimer);hwTimer=null}
+  if(open&&panel===hwpanel){hwTimer=setInterval(loadHardware,2000)}
+  if(open&&onOpen)onOpen();
+}
+infobtn.onclick=function(){togglePanel(drawer)};
+modelsbtn.onclick=function(){togglePanel(modelpanel,loadModels)};
+membtn.onclick=function(){togglePanel(mempanel,loadMemory)};
+sessbtn.onclick=function(){togglePanel(sesspanel,loadSessions)};
+hwbtn.onclick=function(){togglePanel(hwpanel,loadHardware)};
+mailbtn.onclick=function(){togglePanel(mailpanel,loadMail)};
+tasksbtn.onclick=function(){togglePanel(taskspanel,loadTasks)};
 
-/* history restore on reload */
-fetch("/api/history").then(function(r){return r.json()}).then(function(d){
-  var ms=d.messages||[];
-  if(!ms.length)return;
-  hide_wel();
-  ms.forEach(function(m){
-    if(m.role==="user"){addUser(m.content,"text")}
-    else{
-      var div=document.createElement("div");div.className="msg bot";
-      div.innerHTML='<div class="tag">jarvis</div><div class="bubble"></div>';
-      div.querySelector(".bubble").innerHTML=md(m.content);
-      log.appendChild(div);
+/* chat history: render a session transcript into the log */
+function loadHistory(){
+  fetch("/api/history?limit=200").then(function(r){return r.json()}).then(function(d){
+    var ms=d.messages||[];
+    if(!ms.length)return;
+    hide_wel();
+    ms.forEach(function(m){
+      if(m.role==="user"){addUser(m.content,"text")}
+      else{
+        var div=document.createElement("div");div.className="msg bot";
+        div.innerHTML='<div class="tag">jarvis</div><div class="bubble"></div>';
+        div.querySelector(".bubble").innerHTML=md(m.content);
+        log.appendChild(div);
+      }
+    });
+    scroll();
+  }).catch(function(){});
+}
+loadHistory();
+
+/* past conversations */
+function loadSessions(){
+  fetch("/api/sessions").then(function(r){return r.json()}).then(function(d){
+    sesslist.innerHTML="";
+    var h=document.createElement("h3");h.textContent="conversations — click to continue one";
+    sesslist.appendChild(h);
+    var ss=d.sessions||[];
+    if(!ss.length){
+      var e=document.createElement("div");e.className="mem-note";
+      e.textContent="(no conversations yet)";
+      sesslist.appendChild(e);return;
     }
-  });
-  scroll();
-}).catch(function(){});
+    ss.forEach(function(s){
+      var row=document.createElement("div");
+      row.className="sess-row"+(s.id===d.current?" current":"");
+      var t=document.createElement("span");t.className="st";
+      t.textContent=(s.id===d.current?"> ":"")+s.title;
+      var dt=document.createElement("span");dt.className="sd";
+      var when=new Date(s.ts*1000);
+      dt.textContent=when.toLocaleDateString()+" "+
+        ("0"+when.getHours()).slice(-2)+":"+("0"+when.getMinutes()).slice(-2);
+      var c=document.createElement("span");c.className="sc";
+      c.textContent=s.messages+" msg";
+      row.appendChild(t);row.appendChild(dt);row.appendChild(c);
+      row.onclick=function(){loadSession(s.id)};
+      sesslist.appendChild(row);
+    });
+  }).catch(function(){sesslist.innerHTML="<span style='color:#c44'>failed to load</span>"});
+}
+function loadSession(id){
+  fetch("/api/session/load",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({id:id})})
+    .then(function(r){return r.json()}).then(function(d){
+      if(!d.ok){banner("err-banner","!","could not load session "+id);return}
+      sesspanel.classList.remove("open");
+      log.innerHTML="";cur=null;
+      loadHistory();refreshStatus();
+      banner("note","*","continuing conversation #"+d.session);
+    }).catch(function(){});
+}
 
-/* ── workspace: browse + edit files ─────────────────────────── */
+/* ── IDE: file tree + editor + live agent diffs ─────────────── */
 var ws=document.getElementById("ws"),
     wsbtn=document.getElementById("wsbtn"),
+    wsbadge=document.getElementById("wsbadge"),
     wsclose=document.getElementById("wsclose"),
     wspath=document.getElementById("wspath"),
-    wslist=document.getElementById("wslist"),
-    wsedit=document.getElementById("wsedit"),
+    wstree=document.getElementById("wstree"),
     wsfile=document.getElementById("wsfile"),
     wstext=document.getElementById("wstext"),
+    wsdiff=document.getElementById("wsdiff"),
+    wsdiffbtn=document.getElementById("wsdiffbtn"),
     wssave=document.getElementById("wssave"),
     wsask=document.getElementById("wsask"),
-    wsback=document.getElementById("wsback"),
-    wsLoaded=false,wsDirty=false,wsCurFile="";
+    wschanges=document.getElementById("wschanges"),
+    wschglist=document.getElementById("wschglist"),
+    wsLoaded=false,wsDirty=false,wsCurFile="",
+    chgs=[],chgUnseen=0,chgActive=null;
 
 function fsize(n){return n>1048576?(n/1048576).toFixed(1)+"M":n>1024?Math.round(n/1024)+"K":n+"B"}
 
@@ -983,37 +1812,126 @@ function wsRow(label,cls,onclick,size){
 
 function wsLoad(p){
   fetch("/api/workspace?path="+encodeURIComponent(p||"")).then(function(r){return r.json()}).then(function(d){
-    if(d.error){wslist.innerHTML='<div class="ws-err"></div>';wslist.firstChild.textContent=d.error;return}
+    if(d.error){wstree.innerHTML='<div class="ws-err"></div>';wstree.firstChild.textContent=d.error;return}
     wspath.value=d.path;
     var sep=d.path.indexOf("\\")>=0||d.path.indexOf(":")===1?"\\":"/";
-    wslist.innerHTML="";
-    if(d.parent)wslist.appendChild(wsRow("..","dir",function(){wsLoad(d.parent)}));
+    wstree.innerHTML="";
+    if(d.parent)wstree.appendChild(wsRow("..","dir",function(){wsLoad(d.parent)}));
     d.dirs.forEach(function(n){
-      wslist.appendChild(wsRow(n+"/","dir",function(){wsLoad(d.path+sep+n)}));
+      wstree.appendChild(wsRow(n+"/","dir",function(){wsLoad(d.path+sep+n)}));
     });
     d.files.forEach(function(f){
-      wslist.appendChild(wsRow(f.name,"file",function(){wsOpen(d.path+sep+f.name)},f.size));
+      var full=d.path+sep+f.name;
+      var row=wsRow(f.name,"file"+(full===wsCurFile?" active":""),function(){wsOpen(full)},f.size);
+      wstree.appendChild(row);
     });
-    wsedit.style.display="none";wslist.style.display="";
   }).catch(function(){});
 }
 
-function wsOpen(p){
+function wsOpen(p,then){
+  if(wsDirty&&!confirm("Discard unsaved changes to "+wsCurFile+"?"))return;
   fetch("/api/workspace/file?path="+encodeURIComponent(p)).then(function(r){return r.json()}).then(function(d){
     if(d.error){banner("err-banner","!",d.error);return}
     wsCurFile=d.path;wsDirty=false;
     wsfile.textContent=d.path;wsfile.className="";
     wstext.value=d.content;
-    wslist.style.display="none";wsedit.style.display="";
-    wstext.focus();
+    var rows=wstree.querySelectorAll(".ws-row.file");
+    for(var i=0;i<rows.length;i++)rows[i].classList.remove("active");
+    var c=latestChange(d.path);
+    wsdiffbtn.style.display=c?"":"none";
+    if(!then)hideDiff();
+    if(then)then(d);
   }).catch(function(){});
 }
+
+/* diff pane */
+function renderDiff(diffText){
+  wsdiff.innerHTML="";
+  diffText.split("\n").forEach(function(l){
+    var d=document.createElement("div");d.className="diff-line";
+    if(l.indexOf("+++")===0||l.indexOf("---")===0)d.className+=" diff-file";
+    else if(l.indexOf("@@")===0)d.className+=" diff-hunk";
+    else if(l.indexOf("+")===0)d.className+=" diff-add";
+    else if(l.indexOf("-")===0)d.className+=" diff-del";
+    d.textContent=l||" ";
+    wsdiff.appendChild(d);
+  });
+}
+function showDiff(c){
+  renderDiff(c.diff||"(no diff)");
+  wsdiff.classList.add("open");wsdiffbtn.classList.add("on");
+}
+function hideDiff(){wsdiff.classList.remove("open");wsdiffbtn.classList.remove("on")}
+wsdiffbtn.onclick=function(){
+  if(wsdiff.classList.contains("open")){hideDiff();return}
+  var c=latestChange(wsCurFile);
+  if(c)showDiff(c);
+};
+
+/* changes made by the agent */
+function latestChange(path){
+  for(var i=chgs.length-1;i>=0;i--)if(chgs[i].path===path)return chgs[i];
+  return null;
+}
+function fmtTime(ts){
+  var d=new Date((ts||0)*1000);
+  return ("0"+d.getHours()).slice(-2)+":"+("0"+d.getMinutes()).slice(-2);
+}
+function openChange(c){
+  ws.classList.add("open");
+  if(!wsLoaded){wsLoaded=true;wsLoad("")}
+  chgActive=c;
+  wsOpen(c.path,function(){showDiff(c);renderChanges()});
+}
+function renderChanges(){
+  if(!chgs.length){wschanges.style.display="none";return}
+  wschanges.style.display="";
+  wschglist.innerHTML="";
+  chgs.slice().reverse().forEach(function(c){
+    var d=document.createElement("div");
+    d.className="chg-row"+(c===chgActive?" active":"");
+    var p=document.createElement("span");p.className="chg-path";p.textContent=c.path;
+    var a=document.createElement("span");a.className="chg-add";a.textContent="+"+(c.added||0);
+    var r=document.createElement("span");r.className="chg-del";r.textContent="-"+(c.removed||0);
+    var t=document.createElement("span");t.className="chg-time";t.textContent=fmtTime(c.ts);
+    d.appendChild(p);d.appendChild(a);d.appendChild(r);d.appendChild(t);
+    d.onclick=function(){openChange(c)};
+    wschglist.appendChild(d);
+  });
+}
+function updateBadge(){
+  if(chgUnseen>0&&!ws.classList.contains("open")){
+    wsbadge.style.display="";wsbadge.textContent=chgUnseen;
+  }else{wsbadge.style.display="none";chgUnseen=0}
+}
+function onFileEdit(ev,live){
+  chgs.push(ev);if(chgs.length>50)chgs.shift();
+  renderChanges();
+  if(live){
+    if(!ws.classList.contains("open"))chgUnseen++;
+    updateBadge();
+    var name=ev.path.split(/[\\\/]/).pop();
+    var d=addTool('<span class="fn">edit '+esc(name)+'</span> <span class="chg-add">+'+
+      (ev.added||0)+'</span> <span class="chg-del">-'+(ev.removed||0)+
+      '</span> <span class="res">'+esc(ev.path)+'</span>',"edit");
+    d.title="click to view the diff in the IDE";
+    d.onclick=function(){openChange(ev)};
+    if(ws.classList.contains("open")&&ev.path===wsCurFile&&!wsDirty){
+      wsOpen(ev.path,function(){showDiff(ev)});
+    }
+  }
+}
+/* restore agent edits from before this page load */
+fetch("/api/changes").then(function(r){return r.json()}).then(function(d){
+  (d.changes||[]).forEach(function(c){onFileEdit(c,false)});
+}).catch(function(){});
 
 wstext.addEventListener("input",function(){
   if(!wsDirty){wsDirty=true;wsfile.className="dirty"}
 });
 
 wssave.onclick=function(){
+  if(!wsCurFile){banner("note","*","no file open");return}
   fetch("/api/workspace/file",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({path:wsCurFile,content:wstext.value})})
     .then(function(r){return r.json()}).then(function(d){
@@ -1024,14 +1942,11 @@ wssave.onclick=function(){
 };
 
 wsask.onclick=function(){
+  if(!wsCurFile)return;
   box.value="Regarding the file "+wsCurFile+": "+box.value;
+  ws.classList.remove("open");
   box.focus();
   box.setSelectionRange(box.value.length,box.value.length);
-};
-
-wsback.onclick=function(){
-  if(wsDirty&&!confirm("Discard unsaved changes?"))return;
-  wsedit.style.display="none";wslist.style.display="";
 };
 
 wspath.addEventListener("keydown",function(e){
@@ -1040,7 +1955,10 @@ wspath.addEventListener("keydown",function(e){
 
 wsbtn.onclick=function(){
   ws.classList.toggle("open");
-  if(ws.classList.contains("open")&&!wsLoaded){wsLoaded=true;wsLoad("")}
+  if(ws.classList.contains("open")){
+    if(!wsLoaded){wsLoaded=true;wsLoad("")}
+    chgUnseen=0;updateBadge();
+  }
 };
 wsclose.onclick=function(){ws.classList.remove("open")};
 

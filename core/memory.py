@@ -1,9 +1,11 @@
 """Persistent memory — SQLite, stdlib only.
 
-Three tables:
+Tables:
     sessions  — one row per conversation
     messages  — full transcript (history survives restarts, --resume)
     facts     — long-term knowledge the agent saves via memory tools
+    profile   — durable key/value facts about the user, always in context
+    tasks     — scheduled prompts (core.scheduler)
 
 Fact recall is keyword-overlap scoring: deterministic, zero RAM, no
 embedding model required. Swap in embeddings later if one is present —
@@ -50,9 +52,17 @@ CREATE TABLE IF NOT EXISTS tasks (
     prompt TEXT NOT NULL,
     enabled INTEGER DEFAULT 1
 );
+CREATE TABLE IF NOT EXISTS profile (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    ts REAL NOT NULL
+);
 """
 
 _WORD = re.compile(r"[a-zA-Z0-9_]{3,}")
+# Older versions appended the tool log to the stored assistant message;
+# strip it from anything we hand back so it never re-enters model context.
+_TOOL_LOG_RX = re.compile(r"\n\[tools used: .*\]$", re.DOTALL)
 
 
 class Memory:
@@ -63,6 +73,9 @@ class Memory:
         self._lock = threading.Lock()
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            cols = [r[1] for r in self._conn.execute("PRAGMA table_info(messages)")]
+            if "meta" not in cols:
+                self._conn.execute("ALTER TABLE messages ADD COLUMN meta TEXT DEFAULT ''")
             self._conn.commit()
         self.session_id: int = 0
 
@@ -89,13 +102,47 @@ class Memory:
             return self.session_id
         return None
 
-    def add_message(self, role: str, content: str) -> None:
+    def switch_session(self, session_id: int) -> bool:
+        """Continue an earlier conversation. False if it doesn't exist."""
+        with self._lock:
+            row = self._conn.execute("SELECT id FROM sessions WHERE id=?",
+                                     (session_id,)).fetchone()
+        if not row:
+            return False
+        self.session_id = session_id
+        return True
+
+    def sessions(self, limit: int = 60) -> list[dict]:
+        """Conversations, newest first. Empty sessions are skipped; the
+        title falls back to the first user message."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT s.id, s.started_ts, s.title,"
+                " (SELECT COUNT(*) FROM messages m WHERE m.session_id=s.id),"
+                " (SELECT content FROM messages m WHERE m.session_id=s.id"
+                "    AND m.role='user' ORDER BY m.id LIMIT 1)"
+                " FROM sessions s ORDER BY s.id DESC LIMIT ?", (limit * 3,)).fetchall()
+        out = []
+        for sid, ts, title, count, first_user in rows:
+            if count == 0 and sid != self.session_id:
+                continue
+            label = (title or (first_user or "").strip().split("\n")[0][:70]
+                     or "(empty)")
+            out.append({"id": sid, "ts": ts, "title": label, "messages": count})
+            if len(out) >= limit:
+                break
+        return out
+
+    def add_message(self, role: str, content: str, meta: str = "") -> None:
+        """`meta` holds out-of-band detail (e.g. the tool log) that must
+        never re-enter model context or the visible transcript."""
         if not self.session_id:
             self.new_session()
         with self._lock:
             self._conn.execute(
-                "INSERT INTO messages (session_id, ts, role, content) VALUES (?,?,?,?)",
-                (self.session_id, time.time(), role, content))
+                "INSERT INTO messages (session_id, ts, role, content, meta) "
+                "VALUES (?,?,?,?,?)",
+                (self.session_id, time.time(), role, content, meta))
             self._conn.commit()
 
     def recent_messages(self, limit: int, max_chars: int = 4000) -> list[dict]:
@@ -106,10 +153,35 @@ class Memory:
                 "ORDER BY id DESC LIMIT ?", (self.session_id, limit)).fetchall()
         out = []
         for role, content in reversed(rows):
+            content = _TOOL_LOG_RX.sub("", content)
             if len(content) > max_chars:
                 content = content[:max_chars] + "\n...[truncated]"
             out.append({"role": role, "content": content})
         return out
+
+    def session_messages(self, session_id: Optional[int] = None) -> list[dict]:
+        """Full transcript of a session (default: current), oldest first."""
+        sid = session_id or self.session_id
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT ts, role, content FROM messages WHERE session_id=? "
+                "ORDER BY id", (sid,)).fetchall()
+        return [{"ts": ts, "role": role, "content": _TOOL_LOG_RX.sub("", content)}
+                for ts, role, content in rows]
+
+    def export_markdown(self, session_id: Optional[int] = None) -> tuple[str, str]:
+        """Render a session as markdown. Returns (suggested_filename, text)."""
+        sid = session_id or self.session_id
+        msgs = self.session_messages(sid)
+        started = time.strftime("%Y-%m-%d %H:%M",
+                                time.localtime(msgs[0]["ts"] if msgs else time.time()))
+        lines = [f"# JARVIS — session {sid}", f"_{started}_", ""]
+        for m in msgs:
+            who = "You" if m["role"] == "user" else "JARVIS"
+            at = time.strftime("%H:%M", time.localtime(m["ts"]))
+            lines.append(f"**{who}** · {at}\n\n{m['content'].strip()}\n")
+        name = f"jarvis-session-{sid}-{time.strftime('%Y%m%d-%H%M')}.md"
+        return name, "\n".join(lines)
 
     # ── Facts (long-term) ────────────────────────────────────────
 
@@ -159,6 +231,32 @@ class Memory:
                 if len(hits) >= limit:
                     break
         return hits[:limit]
+
+    # ── User profile (always-in-context personal facts) ──────────
+
+    def profile_set(self, key: str, value: str) -> None:
+        key, value = key.strip().lower(), value.strip()
+        if not key or not value:
+            return
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO profile (key, value, ts) VALUES (?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, ts=excluded.ts",
+                (key, value, time.time()))
+            self._conn.commit()
+
+    def profile_delete(self, key: str) -> bool:
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM profile WHERE key=?",
+                                     (key.strip().lower(),))
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def profile_all(self) -> dict[str, str]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT key, value FROM profile ORDER BY key").fetchall()
+        return dict(rows)
 
     # ── Scheduled tasks (used by core.scheduler) ─────────────────
 

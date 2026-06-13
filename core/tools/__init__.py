@@ -28,6 +28,13 @@ class ToolContext:
     scheduler: Any = None
     confirm: Callable[[str], bool] = lambda prompt: True
     notify: Callable[[str], None] = print
+    # One-shot model completion (system, user) -> text. Wired by the
+    # assistant; lets tools ask the local model to summarize/draft without
+    # the chat model having to orchestrate it. Default is a no-op stub.
+    complete: Callable[[str, str], str] = lambda system, user: ""
+    # Called as (path, before_text, after_text) whenever a tool writes a
+    # file — the assistant turns it into a diff event for the IDE view.
+    on_file_change: Callable[[str, str, str], None] = lambda path, before, after: None
 
 
 @dataclass
@@ -127,13 +134,14 @@ class ToolRegistry:
 def build_registry(ctx: ToolContext) -> ToolRegistry:
     """Register all built-in tools plus plugins."""
     registry = ToolRegistry(ctx)
-    from . import files, shell, system, web, dev, memory_sched
+    from . import files, shell, system, web, dev, memory_sched, hardware
     files.register(registry)
     shell.register(registry)
     system.register(registry)
     web.register(registry)
     dev.register(registry)
     memory_sched.register(registry)
+    hardware.register(registry)
 
     email_cfg = (ctx.cfg.email or {}) if ctx.cfg else {}
     if email_cfg.get("user") and email_cfg.get("imap_host"):

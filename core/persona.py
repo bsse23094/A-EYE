@@ -22,6 +22,10 @@ Operating rules:
 - Prefer run_command for ad-hoc computation (counting lines, sizes, batch ops) instead of stretching the search tools.
 - If a tool result already answers the question, stop calling tools and answer.
 - Never end a reply announcing an action you have not performed — either call the tool now or report the result.
+- No narration before tool calls ("Let me check...", "I'll search for...") — call the tool directly, then answer with the findings.
+- Never paste raw tool output or tool-call syntax into your reply; report results in your own words.
+- When the user reveals durable personal information (name, role, preferences, projects, important dates), save it with profile_set in the same turn, without being asked.
+- When a message contains "[Attached file: ...]", read it before answering: read_pdf for .pdf, read_image for images, read_file otherwise.
 - Code assistance: read the relevant files before proposing edits; make edits with edit_file rather than dumping whole files into chat."""
 
 _FALLBACK_TOOL_PROTOCOL = """
@@ -34,7 +38,8 @@ Available tools:
 {tool_docs}"""
 
 
-def build_system_prompt(facts: list[str], fallback_tool_docs: str | None = None) -> str:
+def build_system_prompt(facts: list[str], fallback_tool_docs: str | None = None,
+                        profile: dict[str, str] | None = None) -> str:
     """Assemble the system prompt with live environment context."""
     env = (
         f"\n\nEnvironment: {platform.system()} {platform.release()}, "
@@ -42,6 +47,9 @@ def build_system_prompt(facts: list[str], fallback_tool_docs: str | None = None)
         f"local time {time.strftime('%Y-%m-%d %H:%M (%A)')}"
     )
     prompt = _PERSONA + env
+    if profile:
+        prompt += "\n\nUser profile (use it to personalize; update via profile_set):\n" + \
+            "\n".join(f"- {k}: {v}" for k, v in list(profile.items())[:24])
     if facts:
         prompt += "\n\nKnown facts about the user (from memory):\n" + "\n".join(
             f"- {f}" for f in facts

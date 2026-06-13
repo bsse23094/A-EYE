@@ -200,7 +200,8 @@ class Agent:
                         native_tools: bool, carry: Optional[list] = None) -> list[dict]:
         facts = self.memory.recall(user_text, limit=8)
         docs = None if native_tools else self.registry.docs()
-        system = build_system_prompt(facts, fallback_tool_docs=docs)
+        system = build_system_prompt(facts, fallback_tool_docs=docs,
+                                     profile=self.memory.profile_all())
         msgs: list[dict] = [{"role": "system", "content": system}]
         if carry:
             # Tools turned out unsupported mid-turn: keep accumulated turn
@@ -300,11 +301,13 @@ class Agent:
         return [], text
 
     def _persist_assistant(self, result: TurnResult) -> None:
-        content = result.text
+        # The tool log goes in `meta`, never in the message content: stored
+        # content is replayed into model context on later turns, and models
+        # start imitating raw tool dumps in their replies if they see them.
+        meta = ""
         if result.tool_log:
-            log = "; ".join(
+            meta = "; ".join(
                 f"{name}({json.dumps(args, ensure_ascii=False)[:120]}) -> {out[:200]}"
                 for name, args, out in result.tool_log)
-            content += f"\n[tools used: {log}]"
-        if content.strip():
-            self.memory.add_message("assistant", content)
+        if result.text.strip():
+            self.memory.add_message("assistant", result.text, meta=meta)

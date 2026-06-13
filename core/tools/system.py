@@ -1,4 +1,4 @@
-"""System awareness and control — status, screen, clipboard, input automation."""
+"""System awareness and control — status, screen, vision, clipboard, input."""
 
 from __future__ import annotations
 
@@ -7,6 +7,25 @@ import io
 import os
 import subprocess
 import time
+
+
+def _vision_describe(ctx, img, prompt: str) -> str:
+    """Send a PIL image to the local vision model. Shared by screen + files."""
+    vis = ctx.models.pick("vision") if ctx.models else None
+    if vis is None:
+        return ("No vision-capable model found. Pull one, e.g. "
+                "`ollama pull gemma3` or `ollama pull llava`.")
+    img.thumbnail((1600, 1600))
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, format="JPEG", quality=85)
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    from ..providers import OllamaProvider, ProviderError
+    if not isinstance(vis.provider, OllamaProvider):
+        return f"Vision model {vis.name} is on {vis.provider.name}, which lacks image support here."
+    try:
+        return vis.provider.chat_image(vis.name, prompt, b64) or "(empty response)"
+    except ProviderError as e:
+        return str(e)
 
 
 def register(r) -> None:
@@ -63,22 +82,26 @@ def register(r) -> None:
             from PIL import ImageGrab
         except ImportError:
             return "Pillow not installed — `pip install Pillow`."
-        vis = ctx.models.pick("vision") if ctx.models else None
-        if vis is None:
-            return ("No vision-capable model found. Pull one, e.g. "
-                    "`ollama pull gemma3` or `ollama pull llava`.")
-        img = ImageGrab.grab()
-        img.thumbnail((1600, 1600))
-        buf = io.BytesIO()
-        img.convert("RGB").save(buf, format="JPEG", quality=85)
-        b64 = base64.b64encode(buf.getvalue()).decode()
-        from ..providers import OllamaProvider, ProviderError
-        if not isinstance(vis.provider, OllamaProvider):
-            return f"Vision model {vis.name} is on {vis.provider.name}, which lacks image support here."
+        return _vision_describe(ctx, ImageGrab.grab(), prompt)
+
+    @r.register("read_image", "Look at an image file (photo, screenshot, scan, "
+                "diagram) with the local vision model and describe or answer about it",
+                {"path": "string: image file path",
+                 "?prompt": "string: question about the image"})
+    def read_image(ctx, path: str,
+                   prompt: str = "Describe this image in detail, including any text in it.") -> str:
         try:
-            return vis.provider.chat_image(vis.name, prompt, b64) or "(empty response)"
-        except ProviderError as e:
-            return str(e)
+            from PIL import Image
+        except ImportError:
+            return "Pillow not installed — `pip install Pillow`."
+        path = os.path.abspath(os.path.expanduser(path))
+        if not os.path.isfile(path):
+            return f"Not a file: {path}"
+        try:
+            img = Image.open(path)
+        except Exception as e:
+            return f"Could not open image: {e}"
+        return _vision_describe(ctx, img, prompt)
 
     @r.register("clipboard_get", "Read the clipboard text", {})
     def clipboard_get(ctx) -> str:

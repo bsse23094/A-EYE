@@ -35,6 +35,39 @@ def register(r) -> None:
             body = body[:24000] + f"\n...[truncated; file has {total} lines, use line ranges]"
         return f"{path} (lines {s}-{e} of {total}):\n{body}"
 
+    @r.register("read_pdf", "Extract the text of a PDF file, optionally a page range",
+                {"path": "string: pdf file path",
+                 "?start_page": "integer: 1-based first page",
+                 "?end_page": "integer: last page (inclusive)"})
+    def read_pdf(ctx, path: str, start_page: int = 0, end_page: int = 0) -> str:
+        try:
+            from pypdf import PdfReader
+        except ImportError:
+            return "pypdf not installed — `pip install pypdf`."
+        path = _expand(path)
+        if not os.path.isfile(path):
+            return f"Not a file: {path}"
+        try:
+            reader = PdfReader(path)
+        except Exception as e:
+            return f"Could not open PDF: {e}"
+        total = len(reader.pages)
+        s = max(1, int(start_page) or 1)
+        e = min(total, int(end_page) or total)
+        parts, any_text = [], False
+        for i in range(s - 1, e):
+            text = (reader.pages[i].extract_text() or "").strip()
+            any_text = any_text or bool(text)
+            parts.append(f"--- page {i + 1} ---\n{text or '(no extractable text)'}")
+        body = "\n\n".join(parts)
+        if len(body) > 24000:
+            body = body[:24000] + (f"\n...[truncated; {total} pages total — "
+                                   "use page ranges]")
+        if not any_text:
+            body += ("\n\n[No text layer found — likely a scanned PDF. "
+                     "Use read_image on the file to read it visually.]")
+        return f"{path} (pages {s}-{e} of {total}):\n{body}"
+
     @r.register("write_file", "Create or overwrite a text file",
                 {"path": "string: file path", "content": "string: full file content"})
     def write_file(ctx, path: str, content: str = "") -> str:
@@ -42,9 +75,14 @@ def register(r) -> None:
         parent = os.path.dirname(path)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        existed = os.path.exists(path)
+        existed = os.path.isfile(path)
+        before = ""
+        if existed:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                before = f.read()
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
+        ctx.on_file_change(path, before, content)
         verb = "Overwrote" if existed else "Wrote"
         return f"{verb} {path} ({len(content)} chars)"
 
@@ -68,6 +106,7 @@ def register(r) -> None:
         new_text = text.replace(find, replace) if replace_all else text.replace(find, replace, 1)
         with open(path, "w", encoding="utf-8") as f:
             f.write(new_text)
+        ctx.on_file_change(path, text, new_text)
         return f"Edited {path}: {count if replace_all else 1} replacement(s)."
 
     @r.register("list_dir", "List a directory (entries with sizes)",

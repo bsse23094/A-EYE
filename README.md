@@ -43,10 +43,12 @@ tests/smoke.py       offline smoke tests (no network, no models needed)
 ```
 
 Both frontends are thin renderers over the same event stream
-(`assistant.submit()` → `token` / `thinking` / `tool_start` / `done` events),
-so there is exactly one turn pipeline no matter how you talk to it. Reasoning
-models' **thinking is streamed live** — dimmed in the terminal, a collapsible
-block in the web UI (`"show_thinking": false` to disable).
+(`assistant.submit()` → `token` / `thinking` / `tool_start` / `file_edit` /
+`done` events), so there is exactly one turn pipeline no matter how you talk
+to it. Reasoning models' **thinking is streamed live** — dimmed in the
+terminal, a collapsible block in the web UI (`"show_thinking": false` to
+disable). Every file the agent writes is diffed and broadcast as a
+`file_edit` event, which the web IDE renders side-by-side with the code.
 
 ### Model orchestration — no hardcoded models
 
@@ -70,19 +72,38 @@ with `/model code qwen2.5-coder:14b`.
 
 | group   | tools |
 |---------|-------|
-| files   | `read_file` `write_file` `edit_file` `list_dir` `glob_search` `grep_search` |
+| files   | `read_file` `read_pdf` `write_file` `edit_file` `list_dir` `glob_search` `grep_search` |
 | shell   | `run_command` `open_app` `close_app` |
-| system  | `system_status` `screenshot` `describe_screen` `clipboard_get/set` `set_volume` `type_text` `press_keys` |
+| system  | `system_status` `screenshot` `describe_screen` `read_image` (vision model on any image file) `clipboard_get/set` `set_volume` `type_text` `press_keys` |
+| hardware| `hardware_report` (CPU/GPU/RAM/disk/temps/top processes) `gpu_status` (NVIDIA util/VRAM/temp/power) |
 | web     | `web_search` `fetch_url` (text / links / CSS-selector scraping) `weather` `news_headlines` |
 | dev     | `git` `github` `github_repos` `github_clone` (whitelisted subcommands) `repo_map` |
-| memory  | `remember` `recall_memory` `forget` |
+| memory  | `remember` `recall_memory` `forget` `profile_set` `profile_forget` `export_chat` |
 | tasks   | `schedule_task` `list_tasks` `cancel_task` |
 | models  | `list_models` |
-| email   | `email_unread` `email_read` `email_send` — only when configured |
+| email   | `email_unread` `email_read` `email_search` `email_send` `schedule_email` `email_digest` (AI triage) `email_draft_reply` (AI draft, never auto-sends) — only when configured |
 
 The agent chains tool calls until the task is done (`max_tool_iterations`
-caps runaway loops). Long-term facts are auto-recalled into context by
-relevance on every turn.
+caps runaway loops).
+
+### Memory — JARVIS actually learns who you are
+
+Two layers, both persistent in SQLite:
+
+- **profile** — key/value facts about *you* (name, preferences, projects).
+  Injected into **every** system prompt, so every reply is personalized.
+- **facts** — free-form knowledge, auto-recalled into context by relevance.
+
+Filling them doesn't depend on the model remembering to call a tool: after
+every turn an **auto-memory pass** re-reads your message with a tiny
+extraction prompt (background thread, never blocks the conversation,
+`"auto_memory": false` to disable) and saves anything durable. You'll see
+`remembered: name = Ayyan` notes in chat as it learns. Inspect and edit
+everything in the web UI's **memory** panel or with `/memory` in the
+terminal; the model can also save explicitly via `profile_set` / `remember`.
+
+`export_chat` saves the conversation as markdown (`~/.jarvis/chats` by
+default; the web UI has an *export* button too).
 
 ---
 
@@ -111,15 +132,49 @@ python jarvis.py
 
 `--server` (or `start.bat`) serves a local single-file web app at
 `127.0.0.1:8765`: streaming chat with live **thinking** blocks, tool-call
-traces, a stop button, model-role switcher, voice toggle, and a **workspace
-panel** — browse any folder, open a file, edit and save it right in the
-browser, or hit *ask jarvis* to pull the file into the conversation and let
-the agent edit it with you. The session transcript survives page reloads.
+traces, a stop button, model-role switcher, voice toggle, an *export*
+button (chat → markdown download), and an **IDE panel**:
+
+- file tree + editor — browse any folder, open, edit, save in the browser
+- **live agent diffs** — whenever JARVIS edits a file, the change appears
+  in chat (`edit foo.py +12 -3`, clickable) and in the IDE's *changes*
+  strip; selecting one shows the colored diff side-by-side with the code
+- *ask jarvis* — pull the open file into the conversation and let the
+  agent edit it with you
+
+Plus **file attachments** — hit `+` (or drop a file on the composer) to
+upload a PDF, image, or text file; JARVIS reads it with `read_pdf` /
+`read_image` / `read_file` and answers about it. And a **chats panel** —
+every conversation is kept; browse them by title and date and click one
+to continue it (`/sessions` and `/session <id>` in the terminal).
+
+Three more panels in the top bar:
+
+- **hardware** — a live dashboard (polls ~0.5 Hz while open): gauges for
+  CPU, RAM, GPU (NVIDIA util/VRAM/temp/power via `nvidia-smi`), disks and
+  temperatures, per-core bars, CPU/RAM sparklines, and the heaviest
+  processes. Hit **✨ AI recommendations** and the local model reads the
+  snapshot and tells you what to actually do about it (and **🔥 roast my PC**
+  if you want JARVIS's honest opinion of your rig). CPU temperature is read
+  from `psutil`, falling back to LibreHardwareMonitor/OpenHardwareMonitor's
+  WMI namespace if one is running.
+- **mail** — your Gmail unread list with per-message *read* / *reply*
+  shortcuts and a one-click **✨ AI digest** that triages the inbox by
+  urgency. (Shown only when email is configured.)
+- **tasks** — the automations panel: every scheduled prompt JARVIS runs on
+  its own, with a quick add form and cancel buttons. Equivalent to
+  `schedule_task` / `list_tasks` / `cancel_task` and `/tasks`.
+
+The **models** picker now has a live filter box and a *rescan* button, and
+shows the active chat/code/vision routes at a glance.
+
+The session transcript and the change history survive page reloads.
 
 ### In-session commands
 
 `/voice` `/speak on|off|auto` `/model [role] <name|auto>` `/models` `/tools`
-`/memory` `/forget <id>` `/tasks` `/status` `/new` `/quit`
+`/memory` `/forget <id>` `/sessions` `/session <id>` `/tasks` `/status`
+`/new` `/quit`
 
 ---
 
@@ -139,9 +194,25 @@ defaults). Notable keys:
   "confirm_shell_commands": false,  // set true to approve each command
   "voice_enabled": false,
   "tts_backend": "auto",            // edge-tts -> SAPI fallback; "sapi" = fully offline
-  "email": { "imap_host": "...", "smtp_host": "...", "user": "...", "password": "app-password" }
+  "email": { "imap_host": "imap.gmail.com", "smtp_host": "smtp.gmail.com", "user": "you@gmail.com", "password": "app-password" },
+  "email_check_minutes": 5,         // >0 = watch the inbox, notify on new mail
+  "email_smart_notify": true,       // add a one-line AI summary to each new-mail alert
+  "email_rules": [                  // tag/prioritize incoming mail (first match wins)
+    { "name": "Boss", "from": "boss@", "priority": true }
+  ]
 }
 ```
+
+With email configured you get Gmail automation: `email_search`, scheduled
+sends (`schedule_email`, e.g. "send this at 09:00"), AI inbox triage
+(`email_digest`), and AI-drafted replies (`email_draft_reply` — it drafts,
+you send). With `email_check_minutes` set, a background inbox watcher
+raises a notification the moment new mail lands; `email_smart_notify`
+attaches a one-line AI summary, and `email_rules` tag or prioritize senders
+(a ⚡ on anything matching a `priority` rule). Combine with `schedule_task`
+for email-driven routines: *"every morning at 8, give me an AI digest of my
+unread email and flag anything with a deadline."* — schedule it from the
+**tasks** panel or just ask in chat.
 
 Conversation history, long-term facts, and scheduled tasks persist in
 `~/.jarvis/memory.db` (SQLite, WAL mode).

@@ -89,6 +89,8 @@ class CliFrontend:
                 print("\n" + c(f"[error] {ev['text']}", RED))
             elif kind == "notify":
                 print("\n" + c(f"[jarvis] {ev['text']}", YELLOW))
+            elif kind == "memory":
+                print(c(f"  [memory] {ev['text']}", DIM))
             elif kind == "done":
                 self._thinking = False
                 model = ev.get("model") or "?"
@@ -151,15 +153,31 @@ class CliFrontend:
         elif cmd == "tools":
             print("\n".join(f"  {n}" for n in sorted(a.registry.names())))
         elif cmd == "memory":
+            profile = a.memory.profile_all()
+            if profile:
+                print("  profile:")
+                for k, v in profile.items():
+                    print(f"    {k}: {v}")
             facts = a.memory.all_facts()
             if facts:
+                print("  facts:")
                 for fid, content, topic in facts:
                     tag = f" [{topic}]" if topic else ""
-                    print(f"  #{fid}{tag} {content}")
-            else:
-                print("No saved facts yet. Say 'remember that ...' to add one.")
+                    print(f"    #{fid}{tag} {content}")
+            if not profile and not facts:
+                print("Nothing learned yet — it fills in as you talk "
+                      "(or say 'remember that ...').")
         elif cmd == "forget" and arg.isdigit():
             print("Forgotten." if a.memory.forget(int(arg)) else "No such fact.")
+        elif cmd == "sessions":
+            import time as _t
+            for s in a.memory.sessions(limit=20):
+                mark = ">" if s["id"] == a.memory.session_id else " "
+                when = _t.strftime("%d %b %H:%M", _t.localtime(s["ts"]))
+                print(f"  {mark} #{s['id']:<4} {when}  ({s['messages']:>3} msg)  {s['title']}")
+        elif cmd == "session" and arg.isdigit():
+            ok = a.memory.switch_session(int(arg))
+            print(f"Continuing conversation #{arg}." if ok else f"No session #{arg}.")
         elif cmd == "tasks":
             print(a.scheduler.describe())
         elif cmd == "status":
@@ -229,7 +247,8 @@ _HELP = """commands:
   /model [role] <name|auto>  pin a model to a role (chat/code/vision)
   /models [refresh]   list discovered models and routing
   /tools              list available tools
-  /memory             list long-term facts   /forget <id> removes one
+  /memory             profile + long-term facts   /forget <id> removes a fact
+  /sessions           list past conversations   /session <id> continues one
   /tasks              list scheduled tasks
   /status             component health
   /new                start a fresh conversation session
