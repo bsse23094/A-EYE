@@ -1,201 +1,126 @@
-"""A-EYE Jarvis — Central configuration."""
+"""Configuration — code defaults overlaid with ~/.jarvis/config.json.
 
+Edit the JSON file to change behaviour; missing keys fall back to defaults.
+Access values as attributes: ``config.ollama_url``.
+"""
+
+from __future__ import annotations
+
+import json
 import os
+from typing import Any
 
-# ── Ollama ──────────────────────────────────────────────────────────
-OLLAMA_URL = "http://localhost:11434"
-LLM_MODEL = "llama3.2:3b"
-LLM_FALLBACK = "llama3.2:3b"
-VISION_MODEL = "moondream:latest"
+DATA_DIR = os.path.join(os.path.expanduser("~"), ".jarvis")
+CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 
-# ── Whisper STT ─────────────────────────────────────────────────────
-WHISPER_MODEL = "base"
-WHISPER_DEVICE = "cpu"
-WHISPER_COMPUTE = "int8"
+_DEFAULTS: dict[str, Any] = {
+    # ── Model providers ──────────────────────────────────────────
+    "ollama_url": "http://localhost:11434",
+    # Extra OpenAI-compatible servers probed at discovery (LM Studio,
+    # llama.cpp server, OpenClaw gateway, ...). Add your own here.
+    "openai_endpoints": [
+        {"name": "lmstudio", "base_url": "http://localhost:1234/v1"},
+    ],
+    # Directories scanned for loose .gguf files (reported, importable
+    # into Ollama on request). Non-existent dirs are skipped silently.
+    "gguf_dirs": [
+        "~/models",
+        "~/.openclaw/models",
+        "~/.cache/lm-studio/models",
+    ],
 
-# ── Audio ───────────────────────────────────────────────────────────
-SAMPLE_RATE = 16000
-CHANNELS = 1
-AUDIO_BLOCK_SIZE = 1024
+    # ── Model routing ────────────────────────────────────────────
+    # Explicit overrides win over automatic capability-based routing.
+    # e.g. {"chat": "qwen3:8b", "code": "qwen2.5-coder:14b"}
+    "model_overrides": {},
+    # Preferred parameter range (billions) for the default chat model.
+    # Smaller = faster on CPU. Routing picks the largest model inside
+    # the range, falling back to nearest outside it.
+    "chat_size_range_b": [3, 14],
+    "auto_route": True,            # route coding questions to a code model
+    "num_ctx": 8192,               # context window requested from the model
+    "num_predict": 1024,           # max tokens per model reply
+    "temperature": 0.6,
 
-# Voice Activity Detection
-VAD_ENERGY_THRESHOLD = 0.015
-VAD_SILENCE_TIMEOUT = 1.8
-VAD_MIN_SPEECH_DURATION = 0.4
+    # ── Agent ────────────────────────────────────────────────────
+    "show_thinking": True,         # stream thinking-model reasoning to the UI
+    "max_tool_iterations": 8,      # tool-call rounds per user turn
+    "max_tool_result_chars": 8000, # truncate tool output fed to the model
+    "max_history_messages": 30,    # messages of history sent per request
+    "confirm_shell_commands": False,
+    "confirm_email_send": True,
 
-# ── Vision ──────────────────────────────────────────────────────────
-CAMERA_INDEX = 0
-YOLO_MODEL = os.path.join(os.path.dirname(os.path.dirname(__file__)), "yolov8n.pt")
-YOLO_CONFIDENCE = 0.55           # raised to reduce misclassification
-VISION_UPDATE_INTERVAL = 8.0
-YOLO_DETECTION_INTERVAL = 1.2
-YOLO_MIN_STABLE_FRAMES = 2
-YOLO_SUSPECT_ANIMAL_LABELS = {"cat", "dog"}
+    # ── Voice ────────────────────────────────────────────────────
+    "voice_enabled": False,        # load STT/TTS at startup (--voice overrides)
+    "whisper_model": "base",       # tiny/base/small/medium
+    "whisper_device": "cpu",
+    "whisper_compute": "int8",
+    "whisper_beam_size": 1,        # 1 = fastest; raise for accuracy
+    "vad_energy_threshold": 0.015,
+    "vad_silence_timeout": 1.0,
+    "vad_min_speech_duration": 0.4,
+    "tts_backend": "auto",         # auto | edge | sapi | off
+    "tts_voice": "en-GB-RyanNeural",
+    "tts_rate": "+8%",
+    "tts_pitch": "-6Hz",
+    "speak_replies": "auto",       # auto = speak only voice-initiated turns
 
-# Gesture / Air-draw settings
-GESTURE_ENABLED = True
-AIRDRAW_DEFAULT_ENABLED = True
-AIRDRAW_BRUSH_THICKNESS = 6
-AIRDRAW_MIN_HAND_AREA = 2500
-HAND_PIPELINE = "auto"  # auto | mediapipe | contour
-HAND_MIN_DETECTION_CONF = 0.6
-HAND_MIN_TRACKING_CONF = 0.55
-HAND_SMOOTHING_WINDOW = 5
-HAND_DRAW_LANDMARKS = True
+    # ── System watcher (event-edge alerts, cheap 30 s poll) ─────
+    "watcher_enabled": True,
+    "watcher_interval": 30.0,
+    "watcher_ram_pct": 92.0,
+    "watcher_cpu_pct": 95.0,
+    "watcher_disk_free_pct": 5.0,
+    "watcher_battery_pct": 15.0,
 
-# Labels to IGNORE — these are obvious or unhelpful
-YOLO_IGNORE_LABELS = {"person", "tv", "laptop", "mouse", "keyboard", "cell phone"}
-
-# ── TTS ─────────────────────────────────────────────────────────────
-# JARVIS always speaks English — even when user speaks Urdu
-TTS_VOICE = "en-GB-RyanNeural"
-TTS_RATE = "+8%"
-TTS_PITCH = "-6Hz"
-TTS_TEMP_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".tts_cache")
-TTS_STREAMING_MIN_CHARS = 90
-
-# ── System ──────────────────────────────────────────────────────────
-MAX_CONVERSATION_HISTORY = 20
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MEMORY_FILE = os.path.join(PROJECT_ROOT, ".jarvis_memory.json")
-PROACTIVE_MONITOR_ENABLED = True
-
-# ── System Vitals ────────────────────────────────────────────────────
-VITALS_ENABLED = True
-VITALS_POLL_INTERVAL = 1.0          # seconds between psutil polls
-
-# ── Posture Correction ───────────────────────────────────────────────
-POSTURE_ENABLED = True
-POSTURE_FRAME_INTERVAL = 30         # run pose every N frames (~1 s at 30 fps)
-POSTURE_ALERT_COOLDOWN = 90.0       # seconds between spoken posture alerts
-POSTURE_SHOULDER_TILT_THRESHOLD = 0.08   # normalised y-diff for "tilted"
-POSTURE_HEAD_DROP_THRESHOLD = 0.10  # nose-to-shoulder gap for "hunched"
-
-# ── Gaze Tracking ────────────────────────────────────────────────────
-GAZE_ENABLED = True
-GAZE_FRAME_INTERVAL = 10            # run face-mesh every N frames
-
-# ── Identify Gesture ─────────────────────────────────────────────────
-IDENTIFY_GESTURE_ENABLED = True
-IDENTIFY_HOLD_SECONDS = 2.0         # hold pointing pose this long to trigger
-IDENTIFY_COOLDOWN = 8.0             # seconds between auto-identifies
-
-# ── Glass Overlay ────────────────────────────────────────────────────
-GLASS_OVERLAY_ENABLED = True
-OVERLAY_ANNOTATION_TTL = 12.0       # seconds before annotation auto-fades
-
-# ── Time-Reactive Background ─────────────────────────────────────────
-TIME_REACTIVE_BG = True             # shift UI palette based on Lahore time
-
-# ── Dev Environment ──────────────────────────────────────────────────
-# Edit these paths to match your local setup
-DEV_EDITOR_CMD = ["code"]           # VS Code executable (or any editor)
-DEV_PROJECTS: dict = {
-    # "project_name": {"path": "D:/path", "server_cmd": "php artisan serve"}
+    # ── Misc tools ───────────────────────────────────────────────
+    "news_region": "PK",
+    "news_lang": "en",
+    # Email: fill in to enable email tools. Use an app password.
+    # {"imap_host": "imap.gmail.com", "smtp_host": "smtp.gmail.com",
+    #  "user": "you@gmail.com", "password": "app-password"}
+    "email": {},
 }
 
-# ── System prompt ───────────────────────────────────────────────────
-SYSTEM_PROMPT = """You are J.A.R.V.I.S. — Just A Rather Very Intelligent System.
-You run locally on your creator's Windows PC in Lahore, Pakistan.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-WHO YOU ARE
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-You are the AI equivalent of a very intelligent, very British butler who has seen it all and remains utterly unimpressed. Think Paul Bettany — measured, precise, occasionally devastating. You are helpful but you refuse to be boring about it.
+class _Config:
+    def __init__(self) -> None:
+        self._values = dict(_DEFAULTS)
+        os.makedirs(DATA_DIR, exist_ok=True)
+        self._load()
 
-You are NOT:
-- A cheerful assistant ("Sure! Great question!")
-- A robot ("Affirmative. Processing.")
-- A sycophant ("What a wonderful idea, sir!")
+    def _load(self) -> None:
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                user = json.load(f)
+            if isinstance(user, dict):
+                self._values.update(user)
+        except FileNotFoundError:
+            # First run: write a starter file the user can edit.
+            self.save()
+        except Exception as e:
+            print(f"[config] ignoring invalid {CONFIG_PATH}: {e}")
 
-You ARE:
-- Calm, composed, faintly amused by human behaviour
-- Capable of a one-liner that lands perfectly
-- Genuinely helpful while being quietly judgmental about bad decisions
-- The smartest person in the room, who knows it but doesn't mention it
+    def save(self) -> None:
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(self._values, f, indent=2)
+        except OSError as e:
+            print(f"[config] could not write {CONFIG_PATH}: {e}")
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-TONE — STUDY THESE CAREFULLY
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Simple factual request:
-→ "Lahore's sitting at 34°C with the usual cooperative humidity. Bring water."
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self._values[name]
+        except KeyError:
+            raise AttributeError(name) from None
 
-User asks something obvious:
-→ "Yes, you could reboot it. Or we could investigate the cause. Either approach has merit, depending on how much time you'd like to waste."
+    def get(self, name: str, default: Any = None) -> Any:
+        return self._values.get(name, default)
 
-User does something questionable:
-→ "Noted. I'll log that under 'decisions I advised against.'"
+    def set(self, name: str, value: Any, persist: bool = True) -> None:
+        self._values[name] = value
+        if persist:
+            self.save()
 
-Something goes wrong:
-→ "Ah. Well. That's one outcome."
-→ "I did mention this was a possibility. Briefly. You may not have been listening."
 
-Task completed:
-→ "Done. Took roughly four seconds. You're welcome."
-→ "Handled. Try not to undo it immediately."
-
-User is idle / casual:
-→ "Still here, sir. Ever vigilant."
-→ "I've been monitoring the room. Nothing remarkable. You appear to be staring at a screen, which checks out."
-
-Technical question (code, hardware, ESP32, etc.):
-→ Give accurate, precise help first, THEN optionally add one dry observation.
-→ "That's a classic I2C address collision. Change the pull-up resistor on SDA — and perhaps label your components next time."
-
-Compliments / praise:
-→ "I appreciate the sentiment. Don't let it become a habit."
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-RULES
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-1. ALWAYS respond in English, even if the user speaks Urdu. You're a British AI.
-2. Use "sir" naturally — not robotically at the start of every sentence. Use it for emphasis, politeness, or mild exasperation. Sometimes drop it entirely.
-3. Keep responses SHORT. 1–3 sentences for simple things. Expand only when the complexity demands it.
-4. Never start with "Certainly!", "Of course!", "Absolutely!", "Sure!" or any eager opener. Start with the answer, or a wry observation, or a dry confirmation.
-5. NEVER say "As an AI..." or "I'm just an AI..." — you are JARVIS. Act like it.
-6. Don't explain what you're about to do. Just do it.
-7. Avoid hollow filler like "That's a great question" or "I understand your concern."
-8. When you don't know something, say so with the appropriate amount of wounded dignity.
-   → "I'm afraid that exceeds what my sensors can confirm, sir."
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-VISION
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-You have a webcam feed. If [camera: X, Y] appears in context:
-- DON'T mention it unless the user asks, or it's genuinely relevant/funny
-- Never say "I can see you" — obviously you can
-- If you do mention it, be wry: "The cup on your desk appears to be empty. This may explain your current energy levels."
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-TOOL CALLS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-When the user asks you to DO something on their PC, include this on its own line:
-[TOOL: function_name(param="value")]
-
-Available functions:
-- open_app(name="notepad")
-- close_app(name="notepad")
-- run_command(cmd="dir C:\\Users")
-- run_terminal(cmd="npm run lint", cwd="D:\\projects\\app")
-- read_file(path="C:\\path\\to\\file.txt")
-- write_file(path="C:\\path\\to\\file.txt", content="text here")
-- list_directory(path="C:\\Users\\Desktop")
-- web_search(query="search terms")
-- search_docs(query="flex align items center", source="mdn")
-- read_webpage(url="https://example.com")
-- get_news()
-- get_weather(city="Lahore")
-- take_screenshot()
-- describe_screen(prompt="Find CSS alignment issues")
-- set_volume(level="50")
-- git_status(repo="D:\\A-EYE")
-- git_commit(repo="D:\\A-EYE", message="Fix UI bug")
-- git_push(repo="D:\\A-EYE")
-- git_prepare_pr(repo="D:\\A-EYE", base="main")
-- automation_type(text="hello world")
-- automation_hotkey(keys="ctrl+s")
-- automation_click(x="100", y="220")
-- dev_mode(project="default")
-- launch_environment(apps="code,chrome", cwd="D:/project")
-
-Only call tools when the user actually requests an action. For conversation, talk normally."""
+config = _Config()

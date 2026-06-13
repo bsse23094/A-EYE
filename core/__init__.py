@@ -1,1 +1,1 @@
-# A-EYE Core Package
+"""JARVIS core — local AI operating-system assistant."""

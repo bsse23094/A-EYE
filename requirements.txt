@@ -1,18 +1,24 @@
-# A-EYE Jarvis — Python Dependencies
+# JARVIS — dependencies
+# Core (text mode needs only these two):
+httpx
+psutil
+
+# Web UI (jarvis.py --server / start.bat):
+fastapi
+uvicorn
+
+# Voice (skip if you only use text):
 faster-whisper
-edge-tts
-pyttsx3
-ultralytics
-opencv-python
 sounddevice
 numpy
-httpx
-PyQt6
-pygame
-beautifulsoup4
-requests
-Pillow
-ddgs
-pyautogui
-psutil
-mediapipe>=0.10.14; python_version < "3.13"
+edge-tts
+pyttsx3
+
+# Tools (each degrades gracefully if missing):
+ddgs              # web_search
+Pillow            # screenshot / describe_screen
+pyautogui         # type_text / press_keys
+beautifulsoup4    # cleaner fetch_url extraction
+
+# Quality of life:
+prompt_toolkit    # REPL that redraws cleanly around voice output

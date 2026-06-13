@@ -3,50 +3,39 @@ __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
-.Python
 *.egg-info/
 dist/
 build/
-*.egg
 
 # Virtual environments
 venv/
 .venv/
 env/
-.env/
 
 # IDE
 .vscode/
 .idea/
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
 *.swp
 
-# Model / cache files — large binary assets, don't commit
-.models/
+# JARVIS state (lives in ~/.jarvis by default; ignore local copies too)
+.jarvis/
+*.db
+*.db-wal
+*.db-shm
+
+# Model binaries — never commit
+*.gguf
 *.pt
-*.task
 *.onnx
 *.bin
 *.safetensors
-
-# TTS cache
-.tts_cache/
-
-# JARVIS memory / state
-.jarvis_memory.json
 
 # OS
 .DS_Store
 Thumbs.db
 desktop.ini
 
-# Logs
+# Logs / secrets
 *.log
-
-# Secrets / env
 .env
 *.env
-config_local.py
