@@ -38,6 +38,7 @@ import base64
 import json
 import os
 import queue
+import re
 import socket
 import threading
 import time
@@ -47,6 +48,18 @@ from .assistant import Assistant
 from .config import DATA_DIR, config
 
 _MAX_EDIT_BYTES = 2_000_000
+
+
+def _strip_code_fence(text: str) -> str:
+    """Remove a single wrapping ```lang ... ``` fence if the model added one."""
+    t = (text or "").strip()
+    if t.startswith("```"):
+        nl = t.find("\n")
+        if nl != -1:
+            t = t[nl + 1:]
+        if t.rstrip().endswith("```"):
+            t = t.rstrip()[:-3]
+    return t.rstrip("\n") + "\n" if t.strip() else ""
 
 
 def create_app(assistant: Assistant):
@@ -255,6 +268,104 @@ def create_app(assistant: Assistant):
         except OSError as e:
             return {"error": str(e)}
 
+    # ── AI IDE: code-aware analysis + inline suggestions ─────────
+
+    @app.post("/api/ide/analyze")
+    def ide_analyze(body: dict):
+        """Coding-buddy chat: answer a question about the open file."""
+        question = (body.get("question") or "").strip()
+        path = (body.get("path") or "").strip()
+        code = body.get("code") or ""
+        if not question:
+            return {"error": "empty question"}
+        # Trim code so we never blow the model context.
+        code = code[:12000]
+        lang = os.path.splitext(path)[1].lstrip(".") or "text"
+        system = ("You are a coding buddy embedded in an IDE — like JARVIS pair-programming. "
+                  "Answer the user's question about the open file directly and concisely. "
+                  "Reference function/line names when useful. Prefer short, practical answers; "
+                  "show small code snippets only when they help. No filler.")
+        user = (f"File: {path or '(unsaved)'} [{lang}]\n\n"
+                f"```{lang}\n{code}\n```\n\nQuestion: {question}")
+        answer = assistant.quick_complete(system, user, role="code",
+                                          num_predict=500, temperature=0.3)
+        return {"answer": answer}
+
+    @app.post("/api/ide/apply")
+    def ide_apply(body: dict):
+        """Direct edit: ask the model to rewrite the file per an instruction,
+        write it to disk, and emit a diff event (shows in the changes strip)."""
+        path = (body.get("path") or "").strip()
+        instruction = (body.get("instruction") or "").strip()
+        code = body.get("code") or ""
+        if not path:
+            return {"error": "no file open"}
+        if not instruction:
+            return {"error": "describe the change you want"}
+        full = os.path.abspath(os.path.expanduser(path))
+        if not os.path.isfile(full):
+            return {"error": f"not a file: {full}"}
+        if len(code) > 14000:
+            return {"error": "file too large for direct edit — ask JARVIS in the "
+                             "main chat to use edit_file for surgical changes."}
+        lang = os.path.splitext(path)[1].lstrip(".") or "text"
+        system = ("You are a precise code editor. Apply the requested change to the file "
+                  "and return the COMPLETE updated file content only. No explanation, no "
+                  "commentary. You may wrap it in a single ``` fence. Preserve unrelated "
+                  "code, style, and indentation exactly.")
+        user = (f"Change requested: {instruction}\n\n"
+                f"Current file `{path}` [{lang}]:\n```{lang}\n{code}\n```\n\n"
+                f"Return the full updated file.")
+        out = assistant.quick_complete(system, user, role="code",
+                                       num_predict=4096, temperature=0.1)
+        new_code = _strip_code_fence(out)
+        if not new_code.strip():
+            return {"error": "model returned nothing"}
+        if new_code == code:
+            return {"ok": True, "unchanged": True, "content": code,
+                    "added": 0, "removed": 0}
+        try:
+            with open(full, "w", encoding="utf-8") as f:
+                f.write(new_code)
+        except OSError as e:
+            return {"error": str(e)}
+        # Reuse the assistant's diff plumbing so the edit shows up in the
+        # IDE changes strip and chat exactly like an agent edit.
+        try:
+            assistant._on_file_change(full, code, new_code)
+        except Exception:
+            pass
+        import difflib
+        diff = list(difflib.unified_diff(code.splitlines(), new_code.splitlines()))
+        added = sum(1 for l in diff if l.startswith("+") and not l.startswith("+++"))
+        removed = sum(1 for l in diff if l.startswith("-") and not l.startswith("---"))
+        return {"ok": True, "content": new_code, "added": added, "removed": removed}
+
+    @app.post("/api/ide/suggest")
+    def ide_suggest(body: dict):
+        """Real inline suggestions: a few concrete improvements with line refs."""
+        path = (body.get("path") or "").strip()
+        code = (body.get("code") or "")[:12000]
+        if not code.strip():
+            return {"suggestions": []}
+        lang = os.path.splitext(path)[1].lstrip(".") or "text"
+        system = ("You are a senior code reviewer. Return up to 4 of the most useful, "
+                  "specific suggestions for this file: bugs, risks, or clear improvements. "
+                  "Each suggestion MUST be one line in the exact form:\n"
+                  "LINE <n>: <short actionable suggestion>\n"
+                  "Use the real line number. If the file looks fine, return 'OK'. "
+                  "No preamble, no markdown.")
+        user = f"File: {path} [{lang}]\n\n```{lang}\n{code}\n```"
+        raw = assistant.quick_complete(system, user, role="code",
+                                       num_predict=350, temperature=0.2)
+        suggestions = []
+        for line in (raw or "").splitlines():
+            line = line.strip()
+            m = re.match(r"(?:LINE|Line)\s*(\d+)\s*[:\-]\s*(.+)", line)
+            if m:
+                suggestions.append({"line": int(m.group(1)), "text": m.group(2).strip()})
+        return {"suggestions": suggestions[:4], "raw": raw}
+
     # ── Hardware inspection ──────────────────────────────────────
 
     @app.get("/api/hardware")
@@ -405,9 +516,11 @@ PAGE = r"""
 html,body{height:100%}
 body{
   background:#0c0c0c;color:#c8c8c8;
-  font-family:Consolas,'Courier New',monospace;
-  font-size:14px;line-height:1.6;
+  font-family:'Jetbrains Mono','IBM Plex Mono','Fira Code','Source Code Pro',Consolas,'Courier New',monospace;
+  font-size:13px;line-height:1.6;
   display:flex;flex-direction:column;
+  -webkit-font-smoothing:antialiased;
+  -moz-osx-font-smoothing:grayscale;
 }
 
 ::-webkit-scrollbar{width:5px}
@@ -701,7 +814,7 @@ body{
 
 /* IDE panel */
 .ws{
-  position:fixed;top:0;right:0;bottom:0;width:min(1080px,100%);
+  position:fixed;top:0;right:0;bottom:0;width:min(1360px,100%);
   background:#101010;border-left:1px solid #222;z-index:20;
   display:flex;flex-direction:column;
   transform:translateX(100%);transition:transform .25s ease;
@@ -954,6 +1067,78 @@ body{
   .topbar .status{display:none}
   .ws{width:100%}
 }
+
+/* ── IDE: syntax highlighting, view pane, coding buddy ───────── */
+.code-editor{
+  flex:1;min-width:0;overflow:auto;tab-size:4;
+  font-family:'Jetbrains Mono','Fira Code',Consolas,monospace;
+  font-size:13px;line-height:1.5;background:#0c0c0c;
+}
+.code-line{display:flex;background:#0c0c0c;border-bottom:1px solid #0f0f0f;color:#c8c8c8}
+.code-line:hover{background:#131313}
+.code-line-num{
+  flex-shrink:0;width:48px;padding:0 10px;text-align:right;color:#555;
+  background:#0a0a0a;user-select:none;font-size:11px;border-right:1px solid #1a1a1a;
+}
+.code-line-content{flex:1;padding:0 12px;white-space:pre-wrap;word-break:break-word;position:relative}
+
+/* syntax tokens, scoped under the editor so global .fn/.cls (tool trace) are untouched */
+.code-line-content .kw{color:#d68fd8;font-weight:600}
+.code-line-content .str{color:#8cbf7a}
+.code-line-content .cmnt{color:#5a5a5a;font-style:italic}
+.code-line-content .num{color:#b5a8ff}
+.code-line-content .cls{color:#7eb3d8;font-weight:600}
+.code-line-content .fn{color:#5fb3f0}
+
+/* inline AI suggestion rows injected beneath a source line */
+.code-suggestion-row{display:flex;background:rgba(100,170,255,.06);border-top:1px dashed #1e3346}
+.code-suggestion-row .code-line-num{color:#5bf;background:#0b1622}
+.code-suggestion-row .sg{flex:1;padding:3px 12px;color:#8dd;font-size:11px;line-height:1.4}
+.code-suggestion-row .sg b{color:#bdf;font-weight:600}
+
+/* coding buddy column inside the IDE */
+.ws-buddy{
+  width:320px;min-width:240px;flex-shrink:0;display:flex;flex-direction:column;
+  overflow:hidden;background:#080808;border-left:1px solid #1e1e1e;
+}
+.ws-buddy.hidden{display:none}
+.ws-buddy-head{
+  display:flex;align-items:center;gap:8px;padding:9px 12px;flex-shrink:0;
+  border-bottom:1px solid #1a1a1a;background:#0d0d0d;
+  font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#8aa;font-weight:600;
+}
+.chat-buddy-icon{width:7px;height:7px;border-radius:50%;background:#5a8;flex-shrink:0;box-shadow:0 0 8px #5a8}
+
+.ide-chat-messages{flex:1;overflow-y:auto;overflow-x:hidden;padding:10px 12px;display:flex;flex-direction:column;gap:8px;min-width:0}
+.ide-msg{display:flex;flex-direction:column;gap:3px;font-size:11px;line-height:1.4;max-width:100%}
+.ide-msg.user{align-items:flex-end}
+.ide-msg.assistant{align-items:flex-start}
+.ide-msg-bubble{max-width:92%;padding:6px 9px;border-radius:4px;word-break:break-word;overflow-wrap:anywhere}
+.ide-msg.user .ide-msg-bubble{background:#1a2a3a;color:#9cf}
+.ide-msg.assistant .ide-msg-bubble{background:#141a16;color:#bcd;line-height:1.5}
+.ide-msg-bubble pre{background:#0a0a0a;border:1px solid #1e1e1e;border-radius:4px;padding:6px 8px;margin:5px 0;overflow-x:auto;max-width:100%;font-size:11px;line-height:1.45;white-space:pre}
+.ide-msg-bubble code{background:#10181f;padding:1px 4px;border-radius:2px;font-size:11px;color:#8be}
+.ide-msg-bubble pre code{background:none;padding:0;color:#cdd}
+.ide-msg-bubble p{margin:4px 0}
+.ide-msg-bubble ul,.ide-msg-bubble ol{padding-left:16px;margin:4px 0}
+.ide-msg-bubble li{margin:1px 0}
+.ide-msg-bubble h1,.ide-msg-bubble h2,.ide-msg-bubble h3{font-size:12px;color:#dfe;margin:6px 0 3px}
+.ide-msg-bubble a{color:#5bf;text-decoration:none}
+.ide-msg-bubble b,.ide-msg-bubble strong{color:#dff}
+.ide-msg-time{font-size:9px;color:#555;padding:0 2px}
+.ide-chat-input{display:flex;gap:6px;padding:8px 10px;border-top:1px solid #1a1a1a;flex-shrink:0;background:#0a0a0a}
+.ide-chat-box{flex:1;background:#0c0c0c;border:1px solid #1a1a1a;border-radius:3px;padding:5px 8px;font:inherit;font-size:11px;color:#c8c8c8;outline:none;resize:none;max-height:60px}
+.ide-chat-box:focus{border-color:#2a4a4a}
+.ide-chat-send{background:none;border:1px solid #2a4a4a;color:#888;border-radius:3px;padding:5px 10px;cursor:pointer;font:inherit;font-size:10px;transition:all .15s;flex-shrink:0}
+.ide-chat-send:hover{color:#9cf;border-color:#5bf}
+.ide-apply-btn{color:#7d8;border-color:#264}
+.ide-apply-btn:hover{color:#9f8;border-color:#5a8}
+.ide-apply-btn:disabled{opacity:.4;cursor:default}
+.status-dot{width:5px;height:5px;border-radius:50%}
+.status-dot.ok{background:#5a8;box-shadow:0 0 6px #5a8}
+.status-dot.error{background:#c55;box-shadow:0 0 6px #c55}
+.status-dot.warning{background:#db4}
+@media(max-width:900px){.ws-buddy{display:none}}
 </style>
 </head>
 <body>
@@ -968,7 +1153,7 @@ body{
       <circle cx="15" cy="15" r="2" fill="#cfe8ff"/>
     </svg>
   </div>
-  <button class="navicon" id="wsbtn" data-label="code editor · ide">
+  <button class="navicon" id="wsbtn" data-label="ide · code + ai buddy">
     <svg viewBox="0 0 24 24"><polyline points="9 8 5 12 9 16"/><polyline points="15 8 19 12 15 16"/></svg>
     <span class="badge" id="wsbadge" style="display:none">0</span></button>
   <button class="navicon" id="sessbtn" data-label="past conversations">
@@ -1005,6 +1190,7 @@ body{
   <div class="ws-head">
     <span class="ws-title">ide</span>
     <input id="wspath" spellcheck="false" placeholder="path...">
+    <button id="wsbuddybtn" class="on" title="toggle the coding buddy panel">buddy</button>
     <button id="wsclose">close</button>
   </div>
   <div class="ws-body">
@@ -1012,17 +1198,29 @@ body{
     <div class="ws-main">
       <div class="ws-file-bar">
         <span id="wsfile">select a file from the tree</span>
+        <button id="wsmode" style="display:none" title="switch between highlighted view and editing">edit</button>
+        <button id="wssuggest" style="display:none" title="get inline AI suggestions">&#9889; suggest</button>
         <button id="wsdiffbtn" style="display:none" title="toggle the diff pane">diff</button>
-        <button id="wsask" title="reference this file in chat">ask jarvis</button>
-        <button id="wssave">save</button>
+        <button id="wsask" title="reference this file in the main chat">ask jarvis</button>
+        <button id="wssave" style="display:none">save</button>
       </div>
       <div class="ws-split">
-        <textarea id="wstext" spellcheck="false" placeholder=""></textarea>
+        <div class="ws-view code-editor" id="wsview"></div>
+        <textarea id="wstext" spellcheck="false" placeholder="" style="display:none"></textarea>
         <div class="ws-diff" id="wsdiff"></div>
       </div>
       <div class="ws-changes" id="wschanges" style="display:none">
         <div class="chg-head">changes by jarvis</div>
         <div id="wschglist"></div>
+      </div>
+    </div>
+    <div class="ws-buddy" id="wsbuddy">
+      <div class="ws-buddy-head"><span class="chat-buddy-icon"></span>coding buddy</div>
+      <div class="ide-chat-messages" id="ide-messages"></div>
+      <div class="ide-chat-input">
+        <textarea class="ide-chat-box" id="ide-chat-input" rows="1" placeholder="ask, or describe an edit…"></textarea>
+        <button class="ide-chat-send" id="ide-chat-send" title="ask about the open file (read-only)">ask</button>
+        <button class="ide-chat-send ide-apply-btn" id="ide-chat-apply" title="apply your message as a direct edit (Ctrl+Enter)">apply</button>
       </div>
     </div>
   </div>
@@ -2017,11 +2215,14 @@ function wsOpen(p,then){
     wsCurFile=d.path;wsDirty=false;
     wsfile.textContent=d.path;wsfile.className="";
     wstext.value=d.content;
+    wsRenderView();wsSetMode("view");
+    wsmode.style.display="";wssuggest.style.display="";
     var rows=wstree.querySelectorAll(".ws-row.file");
     for(var i=0;i<rows.length;i++)rows[i].classList.remove("active");
     var c=latestChange(d.path);
     wsdiffbtn.style.display=c?"":"none";
     if(!then)hideDiff();
+    buddyOnOpen(d);
     if(then)then(d);
   }).catch(function(){});
 }
@@ -2145,6 +2346,199 @@ wsbtn.onclick=function(){
 wsclose.onclick=function(){ws.classList.remove("open")};
 
 box.focus();
+
+/* ── coding buddy + syntax-highlight view (inside the one IDE) ─ */
+var ideMessages=document.getElementById("ide-messages"),
+    ideChatInput=document.getElementById("ide-chat-input"),
+    wsview=document.getElementById("wsview"),
+    wsmode=document.getElementById("wsmode"),
+    wssuggest=document.getElementById("wssuggest"),
+    wsbuddy=document.getElementById("wsbuddy"),
+    wsbuddybtn=document.getElementById("wsbuddybtn"),
+    ideBusy=false;
+
+/* language from the file extension — drives the highlighter */
+function ideLangOf(path){
+  var m=(path||"").toLowerCase().match(/\.([a-z0-9]+)$/);
+  var e=m?m[1]:"";
+  if(e==="py"||e==="pyi")return"python";
+  if(e==="js"||e==="jsx"||e==="mjs"||e==="cjs")return"javascript";
+  if(e==="ts"||e==="tsx")return"typescript";
+  if(e==="go")return"go";if(e==="rs")return"rust";
+  if(e==="java")return"java";if(e==="cs")return"csharp";
+  if(e==="c"||e==="h"||e==="cpp"||e==="cc"||e==="hpp")return"c++";
+  return e||"text";
+}
+
+var IDE_KW={
+  python:"def class return if elif else for while try except finally with as import from pass break continue lambda yield global nonlocal raise assert del in is not and or None True False async await self",
+  javascript:"function return if else for while try catch finally const let var new class extends import export from default async await yield typeof instanceof in of this null undefined true false switch case break continue throw delete void",
+  typescript:"function return if else for while try catch finally const let var new class extends implements interface type enum import export from default async await yield typeof instanceof in of this null undefined true false switch case break continue throw public private protected readonly string number boolean any void never",
+  go:"func return if else for range var const type struct interface map chan go defer package import nil true false switch case break continue select",
+  rust:"fn return if else for while loop match let mut const struct enum impl trait use pub mod self Some None Ok Err true false as ref move async await",
+  java:"public private protected class interface extends implements return if else for while try catch finally new import package static final void int String boolean this null true false switch case break continue throw",
+  "c++":"int char float double void return if else for while struct class public private template typename const new delete this nullptr true false switch case break continue include using namespace"
+};
+
+function ideEsc(s){return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}
+
+/* tokenise one line into highlighted HTML (escaped throughout) */
+function ideHi(line,lang){
+  var kws=(IDE_KW[lang]||"").split(" ");
+  var kwset={};for(var i=0;i<kws.length;i++)kwset[kws[i]]=1;
+  var cmt=(lang==="python"||lang==="shell"||lang==="ruby")?"#":(lang==="sql")?"--":"//";
+  var rx=/("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`)|(\/\/[^\n]*|#[^\n]*|--[^\n]*)|(\b\d[\d_.eExXa-fA-F]*\b)|([A-Za-z_$][\w$]*)|(\s+|[^\w\s])/g;
+  var out="",m;
+  while((m=rx.exec(line))!==null){
+    if(m[1]){out+='<span class="str">'+ideEsc(m[1])+'</span>'}
+    else if(m[2]){
+      var c=m[2];
+      var isCmt=(cmt==="#"&&c[0]==="#")||(cmt==="//"&&c.slice(0,2)==="//")||(cmt==="--"&&c.slice(0,2)==="--");
+      out+=isCmt?'<span class="cmnt">'+ideEsc(c)+'</span>':ideEsc(c);
+    }
+    else if(m[3]){out+='<span class="num">'+ideEsc(m[3])+'</span>'}
+    else if(m[4]){
+      var w=m[4];
+      if(kwset[w])out+='<span class="kw">'+ideEsc(w)+'</span>';
+      else if(/^[A-Z]/.test(w))out+='<span class="cls">'+ideEsc(w)+'</span>';
+      else out+=ideEsc(w);
+    }
+    else{out+=ideEsc(m[5]||"")}
+  }
+  return out||"&nbsp;";
+}
+
+/* render the highlighted read view from the textarea's current content */
+function wsRenderView(){
+  var lang=ideLangOf(wsCurFile);
+  var lines=(wstext.value||"").split("\n");
+  var html="";
+  for(var i=0;i<lines.length;i++){
+    html+='<div class="code-line" data-line="'+(i+1)+'">'+
+      '<div class="code-line-num">'+(i+1)+'</div>'+
+      '<div class="code-line-content">'+ideHi(lines[i],lang)+'</div></div>';
+  }
+  wsview.innerHTML=html||'<div class="code-line"><div class="code-line-num">1</div><div class="code-line-content">&nbsp;</div></div>';
+}
+
+/* toggle highlighted view vs editable textarea */
+function wsSetMode(mode){
+  if(mode==="edit"){
+    wsview.style.display="none";wstext.style.display="";
+    wsmode.textContent="view";wssave.style.display="";
+    wstext.focus();
+  }else{
+    wsRenderView();
+    wstext.style.display="none";wsview.style.display="";
+    wsmode.textContent="edit";wssave.style.display=wsDirty?"":"none";
+  }
+}
+wsmode.onclick=function(){wsSetMode(wstext.style.display==="none"?"edit":"view")};
+
+/* coding buddy — operates on the file open in the IDE (wsCurFile / wstext.value) */
+function addIDEMsg(role,text){
+  var d=document.createElement("div");d.className="ide-msg "+role;
+  var bubble=document.createElement("div");bubble.className="ide-msg-bubble";
+  if(role==="assistant")bubble.innerHTML=md(text);else bubble.textContent=text;
+  d.appendChild(bubble);
+  var t=document.createElement("div");t.className="ide-msg-time";
+  var now=new Date();t.textContent=now.getHours()+":"+("0"+now.getMinutes()).slice(-2);
+  d.appendChild(t);
+  ideMessages.appendChild(d);ideMessages.scrollTop=ideMessages.scrollHeight;
+}
+function buddyOnOpen(d){
+  addIDEMsg("assistant","Opened **"+d.path.split(/[\\/]/).pop()+"** ("+
+    (wstext.value||"").split("\n").length+" lines). Ask about it, ⚡ suggest, or describe an edit and hit apply.");
+}
+function buddyWait(label){
+  var w=document.createElement("div");w.className="ide-msg assistant";
+  w.innerHTML='<div class="ide-msg-bubble">'+(label||"")+'<span class="dots"><span></span><span></span><span></span></span></div>';
+  ideMessages.appendChild(w);ideMessages.scrollTop=ideMessages.scrollHeight;return w;
+}
+function buddyBusy(on){
+  ideBusy=on;
+  document.getElementById("ide-chat-send").disabled=on;
+  document.getElementById("ide-chat-apply").disabled=on;
+}
+
+function ideAsk(){
+  var q=(ideChatInput.value||"").trim();
+  if(!q||ideBusy)return;
+  if(!wsCurFile){addIDEMsg("assistant","Open a file from the tree first.");return}
+  addIDEMsg("user",q);ideChatInput.value="";ideChatInput.style.height="auto";
+  buddyBusy(true);var wait=buddyWait("");
+  fetch("/api/ide/analyze",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({question:q,path:wsCurFile,code:wstext.value})})
+    .then(function(r){return r.json()}).then(function(d){
+      wait.remove();addIDEMsg("assistant",d.answer||d.error||"(no answer)");buddyBusy(false);
+    }).catch(function(e){wait.remove();addIDEMsg("assistant","Error: "+e);buddyBusy(false)});
+}
+
+/* direct edit: the message is the instruction; the file is rewritten + saved */
+function ideApply(){
+  var instr=(ideChatInput.value||"").trim();
+  if(!wsCurFile){addIDEMsg("assistant","Open a file from the tree first, then describe the edit.");return}
+  if(!instr){ideChatInput.focus();return}
+  if(ideBusy)return;
+  addIDEMsg("user","✦ edit: "+instr);ideChatInput.value="";ideChatInput.style.height="auto";
+  buddyBusy(true);var wait=buddyWait("✦ rewriting ");
+  fetch("/api/ide/apply",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({path:wsCurFile,instruction:instr,code:wstext.value})})
+    .then(function(r){return r.json()}).then(function(d){
+      wait.remove();buddyBusy(false);
+      if(d.error){addIDEMsg("assistant","⚠️ "+d.error);return}
+      if(d.unchanged){addIDEMsg("assistant","No change needed — the file already satisfies that.");return}
+      wstext.value=d.content;wsDirty=false;wsfile.className="";
+      wsRenderView();wsSetMode("view");
+      addIDEMsg("assistant","✅ Applied & saved to **"+wsCurFile.split(/[\\/]/).pop()+
+        "** (+"+d.added+" −"+d.removed+"). See the diff in the changes strip below.");
+    }).catch(function(e){wait.remove();buddyBusy(false);addIDEMsg("assistant","Error: "+e)});
+}
+
+/* inline AI suggestions injected beneath the referenced source line (view mode) */
+function ideSuggest(){
+  if(!wsCurFile){addIDEMsg("assistant","Open a file from the tree first.");return}
+  if(ideBusy)return;
+  wsSetMode("view");
+  var old=wsview.querySelectorAll(".code-suggestion-row");
+  for(var i=0;i<old.length;i++)old[i].remove();
+  buddyBusy(true);var wait=buddyWait("⚡ reviewing ");
+  fetch("/api/ide/suggest",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({path:wsCurFile,code:wstext.value})})
+    .then(function(r){return r.json()}).then(function(d){
+      wait.remove();buddyBusy(false);
+      var sg=d.suggestions||[];
+      if(!sg.length){addIDEMsg("assistant","Looks solid — no pressing suggestions.");return}
+      sg.forEach(function(s){
+        var anchor=wsview.querySelector('.code-line[data-line="'+s.line+'"]');
+        var row=document.createElement("div");row.className="code-suggestion-row";
+        row.innerHTML='<div class="code-line-num">&#9889;</div>'+
+          '<div class="sg"><b>line '+s.line+':</b> '+esc(s.text)+'</div>';
+        if(anchor&&anchor.nextSibling)wsview.insertBefore(row,anchor.nextSibling);
+        else if(anchor)wsview.appendChild(row);else wsview.insertBefore(row,wsview.firstChild);
+      });
+      addIDEMsg("assistant","Added "+sg.length+" inline suggestion(s) in the view. ⚡ Switch to **edit** to act on them, or tell me to apply one.");
+    }).catch(function(){wait.remove();buddyBusy(false);addIDEMsg("assistant","Review failed.")});
+}
+
+/* wire buddy + view controls */
+document.getElementById("ide-chat-send").onclick=ideAsk;
+document.getElementById("ide-chat-apply").onclick=ideApply;
+wssuggest.onclick=ideSuggest;
+wsbuddybtn.onclick=function(){
+  wsbuddy.classList.toggle("hidden");
+  wsbuddybtn.classList.toggle("on",!wsbuddy.classList.contains("hidden"));
+};
+ideChatInput.addEventListener("keydown",function(e){
+  /* Enter = ask · Ctrl/Cmd+Enter = apply edit */
+  if(e.key==="Enter"&&(e.ctrlKey||e.metaKey)){e.preventDefault();ideApply();return}
+  if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();ideAsk()}
+});
+ideChatInput.addEventListener("input",function(){
+  this.style.height="auto";this.style.height=Math.min(60,this.scrollHeight)+"px";
+});
+
+addIDEMsg("assistant","👋 I'm your coding buddy. Open a file from the tree — it shows with syntax colours. Then **ask** about it, **⚡ suggest** improvements, or type an instruction and hit **apply** to edit the file directly (Ctrl+Enter). Use **edit** in the top bar to hand-edit and **save**.");
 </script>
 </body>
 </html>
