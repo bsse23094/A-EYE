@@ -132,8 +132,8 @@ python jarvis.py
 
 `--server` (or `start.bat`) serves a local single-file web app at
 `127.0.0.1:8765`: streaming chat with live **thinking** blocks, tool-call
-traces, a stop button, model-role switcher, voice toggle, an *export*
-button (chat → markdown download), and an **IDE panel**:
+traces, a stop button, voice toggle, an *export* button (chat → markdown
+download), and an **IDE panel**:
 
 - file tree + editor — browse any folder, open, edit, save in the browser
 - **live agent diffs** — whenever JARVIS edits a file, the change appears
@@ -144,29 +144,35 @@ button (chat → markdown download), and an **IDE panel**:
 
 Plus **file attachments** — hit `+` (or drop a file on the composer) to
 upload a PDF, image, or text file; JARVIS reads it with `read_pdf` /
-`read_image` / `read_file` and answers about it. And a **chats panel** —
-every conversation is kept; browse them by title and date and click one
-to continue it (`/sessions` and `/session <id>` in the terminal).
+`read_image` / `read_file` and answers about it.
 
-Three more panels in the top bar:
+**Premium left sidebar** — a slim icon rail with glowing JARVIS orb, clean
+SVG icons grouped logically (tools, dashboards, session), and animated hover
+tooltips. The active icon gets a blue glow with a left accent bar. Keeps the
+UI clean while staying accessible.
 
-- **hardware** — a live dashboard (polls ~0.5 Hz while open): gauges for
-  CPU, RAM, GPU (NVIDIA util/VRAM/temp/power via `nvidia-smi`), disks and
-  temperatures, per-core bars, CPU/RAM sparklines, and the heaviest
-  processes. Hit **✨ AI recommendations** and the local model reads the
-  snapshot and tells you what to actually do about it (and **🔥 roast my PC**
-  if you want JARVIS's honest opinion of your rig). CPU temperature is read
-  from `psutil`, falling back to LibreHardwareMonitor/OpenHardwareMonitor's
-  WMI namespace if one is running.
-- **mail** — your Gmail unread list with per-message *read* / *reply*
-  shortcuts and a one-click **✨ AI digest** that triages the inbox by
-  urgency. (Shown only when email is configured.)
-- **tasks** — the automations panel: every scheduled prompt JARVIS runs on
-  its own, with a quick add form and cancel buttons. Equivalent to
-  `schedule_task` / `list_tasks` / `cancel_task` and `/tasks`.
+**Floating windows for multitasking**:
 
-The **models** picker now has a live filter box and a *rescan* button, and
-shows the active chat/code/vision routes at a glance.
+- **hardware** — a draggable, resizable glassy window (backdrop-blur +
+  layered shadows) showing a live dashboard (polls ~0.5 Hz while open): CPU/RAM/GPU
+  gauges, per-core bars, sparklines, top processes, and temperatures. Hit
+  **✨ AI recommendations** for the local model to read the snapshot and
+  give tuning advice, or **🔥 roast my PC** for its honest opinion. CPU
+  temperature from `psutil` or LibreHardwareMonitor WMI namespace. GPU via
+  `nvidia-smi` if present.
+- **mail** — Gmail unread list with per-message *read* / *reply* shortcuts,
+  one-click **✨ AI digest** triage, and optional inbox rules (priority
+  flags, smart summaries). (Shown when email is configured.)
+- **tasks** — automations panel: scheduled prompts with add/cancel controls,
+  equivalent to the terminal's `schedule_task` / `list_tasks` / `cancel_task`.
+
+Keep all open at once for true multitasking — drag them around, resize from
+the bottom-right corner, click one to bring it to front. Close via the × button
+in the title bar.
+
+**Slide-down drawers** (models, memory, past conversations, system info) stay
+as quick toggles from the sidebar since they're transient settings rather than
+always-open dashboards.
 
 The session transcript and the change history survive page reloads.
 

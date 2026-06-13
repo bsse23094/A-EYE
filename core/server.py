@@ -807,9 +807,90 @@ body{
 .panel-tools .pbtn.accent{color:#5bf;border-color:#244}
 .panel-tools .pbtn.accent:hover{border-color:#5bf}
 
+/* ── app shell: left icon rail + main column ───────────────── */
+.shell{flex:1;display:flex;min-height:0}
+.main{flex:1;display:flex;flex-direction:column;min-width:0;position:relative}
+
+.sidebar{
+  width:58px;flex-shrink:0;background:#070707;
+  border-right:1px solid #161616;z-index:30;
+  display:flex;flex-direction:column;align-items:center;
+  padding:11px 0 12px;gap:3px;
+}
+.side-brand{width:30px;height:30px;margin-bottom:10px;opacity:.95}
+.side-brand svg{width:30px;height:30px;display:block}
+.side-spacer{flex:1}
+.side-sep{width:24px;height:1px;background:#1c1c1c;margin:5px 0}
+
+.navicon{
+  position:relative;width:40px;height:40px;border:none;background:none;
+  color:#585858;border-radius:10px;cursor:pointer;
+  display:flex;align-items:center;justify-content:center;
+  transition:color .18s,background .18s,box-shadow .2s;
+}
+.navicon svg{width:19px;height:19px;stroke:currentColor;fill:none;
+  stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+.navicon:hover{color:#e2e2e2;background:#151515}
+.navicon:active{transform:translateY(1px)}
+.navicon.active{
+  color:#7cc4ff;background:linear-gradient(180deg,#15222f,#0e1620);
+  box-shadow:inset 0 0 0 1px #1d3247;
+}
+.navicon.active::before{
+  content:"";position:absolute;left:-11px;top:10px;bottom:10px;width:2px;
+  border-radius:2px;background:#5bf;box-shadow:0 0 9px #5bf;
+}
+.navicon::after{
+  content:attr(data-label);position:absolute;left:50px;top:50%;
+  transform:translateY(-50%) translateX(-5px) scale(.96);transform-origin:left center;
+  background:#1c1c1c;color:#d2d2d2;font-size:11px;letter-spacing:.4px;
+  padding:5px 10px;border-radius:7px;white-space:nowrap;
+  border:1px solid #2b2b2b;box-shadow:0 8px 22px -10px #000;
+  opacity:0;pointer-events:none;transition:opacity .15s,transform .15s;z-index:60;
+}
+.navicon:hover::after{opacity:1;transform:translateY(-50%) translateX(0) scale(1)}
+.navicon .badge{position:absolute;top:3px;right:3px;margin:0}
+/* voice states on the rail icon */
+.navicon.v-on{color:#5bf}
+.navicon.v-listening{color:#5c5;animation:pulse 1.5s infinite}
+.navicon.v-speaking{color:#db4}
+.navicon.v-loading{color:#888}
+
+/* ── floating windows: draggable + resizable, glassy ───────── */
+.fwin{
+  position:fixed;z-index:42;display:none;flex-direction:column;
+  min-width:320px;min-height:220px;width:480px;height:540px;
+  background:rgba(13,13,14,.94);backdrop-filter:blur(16px) saturate(120%);
+  -webkit-backdrop-filter:blur(16px) saturate(120%);
+  border:1px solid #2a2a2a;border-radius:12px;overflow:hidden;resize:both;
+  box-shadow:0 28px 70px -20px rgba(0,0,0,.9),0 0 0 1px rgba(120,180,255,.05),
+             inset 0 1px 0 rgba(255,255,255,.03);
+}
+.fwin.open{display:flex;animation:fwin-in .19s cubic-bezier(.2,.8,.3,1)}
+@keyframes fwin-in{from{opacity:0;transform:scale(.97) translateY(8px)}to{opacity:1;transform:none}}
+.fwin-head{
+  display:flex;align-items:center;gap:9px;padding:9px 11px 9px 13px;cursor:move;
+  border-bottom:1px solid #1b1b1b;flex-shrink:0;user-select:none;
+  background:linear-gradient(180deg,#151515,#101010);
+}
+.fwin-head .fw-dot{width:8px;height:8px;border-radius:50%;
+  background:#5bf;box-shadow:0 0 9px #5bf;flex-shrink:0}
+.fwin-head .fw-title{flex:1;font-size:11px;text-transform:uppercase;
+  letter-spacing:1.6px;color:#a8a8a8}
+.fwin-head .fw-x{
+  width:24px;height:24px;border:none;background:none;color:#666;cursor:pointer;
+  border-radius:6px;font-size:15px;line-height:1;
+  display:flex;align-items:center;justify-content:center;transition:all .15s;
+}
+.fwin-head .fw-x:hover{background:#2a1717;color:#ec8}
+.fwin-body{flex:1;overflow-y:auto;padding:14px 16px;min-height:0}
+.fwin::after{
+  content:"";position:absolute;right:3px;bottom:3px;width:9px;height:9px;
+  border-right:2px solid #3a3a3a;border-bottom:2px solid #3a3a3a;
+  border-radius:0 0 3px 0;pointer-events:none;opacity:.7;
+}
+
 /* ── hardware dashboard ────────────────────────────────────── */
-#hwpanel.open{max-height:88vh}
-#hwpanel .model-panel-inner{max-height:84vh}
 .hw-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}
 .hw-card{
   border:1px solid #1c1c1c;border-radius:6px;padding:11px 13px;background:#0d0d0d;
@@ -877,21 +958,47 @@ body{
 </head>
 <body>
 
+<div class="shell">
+<nav class="sidebar">
+  <div class="side-brand" title="JARVIS">
+    <svg viewBox="0 0 30 30">
+      <circle cx="15" cy="15" r="12" fill="none" stroke="#214257" stroke-width="1"/>
+      <circle cx="15" cy="15" r="7" fill="none" stroke="#2f6486" stroke-width="1" stroke-dasharray="3 4"/>
+      <circle cx="15" cy="15" r="4" fill="#5bf" opacity=".4"/>
+      <circle cx="15" cy="15" r="2" fill="#cfe8ff"/>
+    </svg>
+  </div>
+  <button class="navicon" id="wsbtn" data-label="code editor · ide">
+    <svg viewBox="0 0 24 24"><polyline points="9 8 5 12 9 16"/><polyline points="15 8 19 12 15 16"/></svg>
+    <span class="badge" id="wsbadge" style="display:none">0</span></button>
+  <button class="navicon" id="sessbtn" data-label="past conversations">
+    <svg viewBox="0 0 24 24"><path d="M4 5h16v11H8l-4 4z"/></svg></button>
+  <button class="navicon" id="membtn" data-label="what jarvis remembers">
+    <svg viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="7" ry="3"/><path d="M5 6v12c0 1.7 3.1 3 7 3s7-1.3 7-3V6"/><path d="M5 12c0 1.7 3.1 3 7 3s7-1.3 7-3"/></svg></button>
+  <button class="navicon" id="modelsbtn" data-label="switch models">
+    <svg viewBox="0 0 24 24"><polygon points="12 3 21 8 12 13 3 8 12 3"/><polyline points="3 13 12 18 21 13"/></svg></button>
+  <div class="side-sep"></div>
+  <button class="navicon" id="hwbtn" data-label="hardware dashboard">
+    <svg viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="1.5"/><path d="M10 2v3M14 2v3M10 19v3M14 19v3M2 10h3M2 14h3M19 10h3M19 14h3"/></svg></button>
+  <button class="navicon" id="mailbtn" data-label="gmail · automation">
+    <svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 7l9 6 9-6"/></svg></button>
+  <button class="navicon" id="tasksbtn" data-label="scheduled automations">
+    <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/></svg></button>
+  <button class="navicon" id="infobtn" data-label="system info">
+    <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></svg></button>
+  <div class="side-spacer"></div>
+  <button class="navicon" id="micbtn" data-label="voice">
+    <svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M6 11a6 6 0 0 0 12 0M12 17v4"/></svg></button>
+  <button class="navicon" id="exportbtn" data-label="download chat">
+    <svg viewBox="0 0 24 24"><path d="M12 4v10M8 11l4 4 4-4M5 19h14"/></svg></button>
+  <button class="navicon" id="newbtn" data-label="new session">
+    <svg viewBox="0 0 24 24"><path d="M12 6v12M6 12h12"/></svg></button>
+</nav>
+<div class="main">
 <div class="topbar">
   <span class="name">JARVIS</span>
   <span class="sep">/</span>
   <span class="status" id="chip">starting&hellip;</span>
-  <button id="wsbtn" title="code editor with live agent diffs">ide<span class="badge" id="wsbadge" style="display:none">0</span></button>
-  <button id="sessbtn" title="browse past conversations">chats</button>
-  <button id="membtn" title="what jarvis remembers about you">memory</button>
-  <button id="modelsbtn" title="switch models">models</button>
-  <button id="hwbtn" title="hardware dashboard with AI recommendations">hardware</button>
-  <button id="mailbtn" title="gmail inbox &amp; automation">mail</button>
-  <button id="tasksbtn" title="scheduled automations">tasks</button>
-  <button id="infobtn" title="system info">info</button>
-  <button id="micbtn" title="toggle voice">voice</button>
-  <button id="exportbtn" title="download this chat as markdown">export</button>
-  <button id="newbtn" title="new session">new</button>
 </div>
 
 <div class="ws" id="ws">
@@ -924,9 +1031,6 @@ body{
 <div class="model-panel" id="modelpanel"><div class="model-panel-inner" id="modellist">loading...</div></div>
 <div class="model-panel" id="mempanel"><div class="model-panel-inner" id="memlist">loading...</div></div>
 <div class="model-panel" id="sesspanel"><div class="model-panel-inner" id="sesslist">loading...</div></div>
-<div class="model-panel" id="hwpanel"><div class="model-panel-inner" id="hwbody">loading...</div></div>
-<div class="model-panel" id="mailpanel"><div class="model-panel-inner" id="mailbody">loading...</div></div>
-<div class="model-panel" id="taskspanel"><div class="model-panel-inner" id="tasksbody">loading...</div></div>
 <div class="drawer" id="drawer"><div class="drawer-inner" id="dinfo"></div></div>
 
 <div id="chat">
@@ -999,6 +1103,25 @@ body{
   </div>
   <div class="compose-hint">enter to send &middot; shift+enter for newline &middot; + or drop a file to attach</div>
   <input type="file" id="fileinput" multiple style="display:none">
+</div>
+</div><!-- /.main -->
+</div><!-- /.shell -->
+
+<!-- floating, draggable + resizable windows -->
+<div class="fwin" id="hwwin" style="top:64px;right:30px">
+  <div class="fwin-head" data-win="hwwin"><span class="fw-dot"></span>
+    <span class="fw-title">hardware</span><button class="fw-x" data-win="hwwin">&times;</button></div>
+  <div class="fwin-body"><div id="hwbody">loading...</div></div>
+</div>
+<div class="fwin" id="mailwin" style="top:96px;right:70px;width:560px">
+  <div class="fwin-head" data-win="mailwin"><span class="fw-dot"></span>
+    <span class="fw-title">mail</span><button class="fw-x" data-win="mailwin">&times;</button></div>
+  <div class="fwin-body"><div id="mailbody">loading...</div></div>
+</div>
+<div class="fwin" id="taskswin" style="top:128px;right:110px;width:520px;height:440px">
+  <div class="fwin-head" data-win="taskswin"><span class="fw-dot"></span>
+    <span class="fw-title">automations</span><button class="fw-x" data-win="taskswin">&times;</button></div>
+  <div class="fwin-body"><div id="tasksbody">loading...</div></div>
 </div>
 
 <script>
@@ -1222,13 +1345,13 @@ refreshStatus();setInterval(refreshStatus,15000);
 /* voice UI */
 function voiceUI(st){
   var on=st&&st!=="off"&&st!=="unavailable";
-  micbtn.className="";
-  if(st==="listening"){micbtn.className="voice-listening";micbtn.textContent="listening..."}
-  else if(st==="speaking"){micbtn.className="voice-speaking";micbtn.textContent="speaking..."}
-  else if(st==="loading"){micbtn.className="voice-loading";micbtn.textContent="loading..."}
-  else if(st==="transcribing"){micbtn.className="voice-loading";micbtn.textContent="thinking..."}
-  else if(on){micbtn.className="on";micbtn.textContent="voice on"}
-  else{micbtn.textContent="voice"}
+  micbtn.className="navicon";          /* keep the rail icon, swap state class + tooltip */
+  if(st==="listening"){micbtn.classList.add("v-listening");micbtn.setAttribute("data-label","listening…")}
+  else if(st==="speaking"){micbtn.classList.add("v-speaking");micbtn.setAttribute("data-label","speaking…")}
+  else if(st==="loading"){micbtn.classList.add("v-loading");micbtn.setAttribute("data-label","loading…")}
+  else if(st==="transcribing"){micbtn.classList.add("v-loading");micbtn.setAttribute("data-label","thinking…")}
+  else if(on){micbtn.classList.add("v-on","active");micbtn.setAttribute("data-label","voice on")}
+  else{micbtn.setAttribute("data-label","voice")}
 }
 
 /* model switcher — with search + refresh */
@@ -1475,7 +1598,7 @@ function loadMail(){
           var a=b.getAttribute("data-a");
           if(a==="read"){q("Read email #"+m.id+" and summarize it.")}
           else{box.value="Draft a reply to email #"+m.id+": ";box.focus()}
-          togglePanel(mailpanel);
+          closeWin("mailwin");
         };
       });
       mailbody.appendChild(row);
@@ -1673,7 +1796,7 @@ function q(t){box.value=t;send()}
 
 /* voice toggle */
 micbtn.onclick=function(){
-  micbtn._t=true;var on=!micbtn.className.match(/on|listening|speaking/);
+  micbtn._t=true;var on=!/v-(on|listening|speaking)/.test(micbtn.className);
   fetch("/api/voice",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({on:on})})
     .then(function(r){return r.json()}).then(function(r){voiceUI(r.active?"on":"off");if(r.message)banner("note","*",r.message)})
     .catch(function(){});
@@ -1689,34 +1812,93 @@ newbtn.onclick=function(){
   }).catch(function(){});
 };
 
-/* drawer toggles (mutually exclusive) */
-var hwpanel=document.getElementById("hwpanel"),
-    hwbody=document.getElementById("hwbody"),
-    mailpanel=document.getElementById("mailpanel"),
-    mailbody=document.getElementById("mailbody"),
-    taskspanel=document.getElementById("taskspanel"),
-    tasksbody=document.getElementById("tasksbody"),
-    hwbtn=document.getElementById("hwbtn"),
-    mailbtn=document.getElementById("mailbtn"),
-    tasksbtn=document.getElementById("tasksbtn"),
-    hwTimer=null;
-var ALL_PANELS=[drawer,modelpanel,mempanel,sesspanel,hwpanel,mailpanel,taskspanel];
+/* ── slide-down drawers: models / memory / chats / info ────── */
 function togglePanel(panel,onOpen){
-  ALL_PANELS.forEach(function(p){if(p!==panel)p.classList.remove("open")});
-  panel.classList.toggle("open");
-  var open=panel.classList.contains("open");
-  /* hardware polls live only while its panel is open */
-  if(hwTimer){clearInterval(hwTimer);hwTimer=null}
-  if(open&&panel===hwpanel){hwTimer=setInterval(loadHardware,2000)}
+  [drawer,modelpanel,mempanel,sesspanel].forEach(function(p){if(p!==panel)p.classList.remove("open")});
+  var open=panel.classList.toggle("open");
+  syncNav();
   if(open&&onOpen)onOpen();
 }
 infobtn.onclick=function(){togglePanel(drawer)};
 modelsbtn.onclick=function(){togglePanel(modelpanel,loadModels)};
 membtn.onclick=function(){togglePanel(mempanel,loadMemory)};
 sessbtn.onclick=function(){togglePanel(sesspanel,loadSessions)};
-hwbtn.onclick=function(){togglePanel(hwpanel,loadHardware)};
-mailbtn.onclick=function(){togglePanel(mailpanel,loadMail)};
-tasksbtn.onclick=function(){togglePanel(taskspanel,loadTasks)};
+
+/* ── floating windows: hardware / mail / automations ───────── */
+var hwbody=document.getElementById("hwbody"),
+    mailbody=document.getElementById("mailbody"),
+    tasksbody=document.getElementById("tasksbody"),
+    hwbtn=document.getElementById("hwbtn"),
+    mailbtn=document.getElementById("mailbtn"),
+    tasksbtn=document.getElementById("tasksbtn"),
+    hwTimer=null,_zTop=42;
+var WINS={
+  hwwin:{btn:hwbtn,onOpen:loadHardware},
+  mailwin:{btn:mailbtn,onOpen:loadMail},
+  taskswin:{btn:tasksbtn,onOpen:loadTasks}
+};
+function winEl(id){return document.getElementById(id)}
+function focusWin(id){var w=winEl(id);if(w)w.style.zIndex=(++_zTop)}
+function openWin(id){
+  var w=winEl(id);if(!w)return;
+  w.classList.add("open");focusWin(id);
+  if(id==="hwwin"){if(hwTimer)clearInterval(hwTimer);hwTimer=setInterval(loadHardware,2000)}
+  if(WINS[id]&&WINS[id].onOpen)WINS[id].onOpen();
+  syncNav();
+}
+function closeWin(id){
+  var w=winEl(id);if(!w)return;
+  w.classList.remove("open");
+  if(id==="hwwin"&&hwTimer){clearInterval(hwTimer);hwTimer=null}
+  syncNav();
+}
+function toggleWin(id){
+  var w=winEl(id);if(!w)return;
+  w.classList.contains("open")?closeWin(id):openWin(id);
+}
+hwbtn.onclick=function(){toggleWin("hwwin")};
+mailbtn.onclick=function(){toggleWin("mailwin")};
+tasksbtn.onclick=function(){toggleWin("taskswin")};
+
+/* nav active-state sync */
+function syncNav(){
+  modelsbtn.classList.toggle("active",modelpanel.classList.contains("open"));
+  membtn.classList.toggle("active",mempanel.classList.contains("open"));
+  sessbtn.classList.toggle("active",sesspanel.classList.contains("open"));
+  infobtn.classList.toggle("active",drawer.classList.contains("open"));
+  Object.keys(WINS).forEach(function(id){
+    WINS[id].btn.classList.toggle("active",winEl(id).classList.contains("open"));
+  });
+}
+
+/* make every floating window draggable by its header + click-to-front */
+(function(){
+  var fwins=document.querySelectorAll(".fwin");
+  for(var i=0;i<fwins.length;i++)(function(win){
+    win.addEventListener("mousedown",function(){focusWin(win.id)},true);
+    var head=win.querySelector(".fwin-head"),dragging=false,ox=0,oy=0;
+    head.addEventListener("mousedown",function(e){
+      if(e.target.classList.contains("fw-x"))return;
+      dragging=true;
+      var r=win.getBoundingClientRect();
+      ox=e.clientX-r.left;oy=e.clientY-r.top;
+      win.style.right="auto";win.style.bottom="auto";
+      win.style.left=r.left+"px";win.style.top=r.top+"px";
+      document.body.style.userSelect="none";e.preventDefault();
+    });
+    window.addEventListener("mousemove",function(e){
+      if(!dragging)return;
+      var x=Math.max(0,Math.min(window.innerWidth-60,e.clientX-ox));
+      var y=Math.max(0,Math.min(window.innerHeight-28,e.clientY-oy));
+      win.style.left=x+"px";win.style.top=y+"px";
+    });
+    window.addEventListener("mouseup",function(){
+      if(dragging){dragging=false;document.body.style.userSelect=""}
+    });
+  })(fwins[i]);
+  var xs=document.querySelectorAll(".fwin-head .fw-x");
+  for(var j=0;j<xs.length;j++)xs[j].onclick=function(){closeWin(this.getAttribute("data-win"))};
+})();
 
 /* chat history: render a session transcript into the log */
 function loadHistory(){
